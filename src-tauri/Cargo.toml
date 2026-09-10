@@ -1,6 +1,6 @@
 [package]
 name = "opinion-insights-launcher"
-version = "2.2.0"
+version = "2.3.0"
 description = "Opinion Insights Browser Desktop Launcher"
 authors = ["Opinion Insights Team"]
 edition = "2021"

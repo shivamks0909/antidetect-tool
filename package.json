@@ -1,7 +1,7 @@
 {
   "name": "opinion-insights-browser",
   "private": true,
-  "version": "2.2.0",
+  "version": "2.3.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -24,9 +24,12 @@
     "@tauri-apps/plugin-process": "^2.3.1",
     "@tauri-apps/plugin-updater": "^2.11.0",
     "flag-icons": "^7.5.0",
+    "libsodium-wrappers": "^0.8.4",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
     "tailwindcss": "^4.3.1",
+    "tweetnacl": "^1.0.3",
+    "tweetnacl-util": "^0.15.1",
     "xlsx": "^0.18.5",
     "zustand": "^5.0.14"
   },
