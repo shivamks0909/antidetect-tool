@@ -1,0 +1,42 @@
+{
+  "name": "opinion-insights-browser",
+  "private": true,
+  "version": "2.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build:ui-kit": "npm --prefix ui-kit run build:lib",
+    "prebuild": "npm run build:ui-kit",
+    "build": "tsc && vite build",
+    "preview": "vite preview",
+    "tauri": "tauri",
+    "release:keys": "node scripts/generate-update-keys.mjs"
+  },
+  "dependencies": {
+    "@hugeicons/core-free-icons": "^4.3.0",
+    "@hugeicons/react": "^1.1.9",
+    "@proxyshard/shardx-ui-kit": "file:./ui-kit",
+    "@supabase/supabase-js": "^2.115.0",
+    "@tailwindcss/vite": "^4.3.1",
+    "@tauri-apps/api": "^2",
+    "@tauri-apps/plugin-dialog": "^2.7.1",
+    "@tauri-apps/plugin-opener": "^2",
+    "@tauri-apps/plugin-process": "^2.3.1",
+    "@tauri-apps/plugin-updater": "^2.11.0",
+    "flag-icons": "^7.5.0",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
+    "tailwindcss": "^4.3.1",
+    "xlsx": "^0.18.5",
+    "zustand": "^5.0.14"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2",
+    "@types/react": "^19.1.8",
+    "@types/react-dom": "^19.1.6",
+    "@vitejs/plugin-react": "^4.6.0",
+    "playwright": "^1.63.0",
+    "typescript": "~5.8.3",
+    "vite": "^5.4.10"
+  }
+}

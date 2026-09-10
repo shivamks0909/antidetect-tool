@@ -1,0 +1,167 @@
+# Build the Opinion Insights Browser desktop app on GitHub-hosted runners,
+# sign update packages with Ed25519 private key, generate latest.json for auto-updates,
+# and attach all distributables to a GitHub Release.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to publish (e.g. v2.0.2). Required for manual runs.'
+        required: true
+
+permissions:
+  contents: write # needed to create / attach assets to releases
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            label: win-x64
+          - os: macos-14
+            target: aarch64-apple-darwin
+            label: mac-arm64
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            label: linux-x64
+
+    runs-on: ${{ matrix.os }}
+    name: build (${{ matrix.label }})
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            ui-kit/package-lock.json
+
+      - name: Set up Rust (stable, ${{ matrix.target }})
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo registry + build target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: ${{ matrix.label }}-cargo-${{ hashFiles('src-tauri/Cargo.lock') }}
+          restore-keys: |
+            ${{ matrix.label }}-cargo-
+
+      - name: Install Linux build deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            patchelf
+
+      - name: npm install
+        run: npm ci
+
+      - name: Build Tauri Bundle & Generate Updater Packages
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: npx tauri build --target ${{ matrix.target }}
+
+      - name: Collect bundles & updater artifacts
+        shell: bash
+        run: |
+          mkdir -p staging
+          # Collect all installers, updaters (.zip), signatures (.sig), and metadata
+          find src-tauri/target/${{ matrix.target }}/release/bundle \
+            -type f \
+            \( -name '*.dmg' -o -name '*.app.tar.gz' \
+               -o -name '*.msi' -o -name '*.exe' \
+               -o -name '*.zip' -o -name '*.sig' \
+               -o -name 'latest.json' \
+               -o -name '*.AppImage' -o -name '*.deb' -o -name '*.rpm' \) \
+            -exec cp -v {} staging/ \;
+          ls -la staging/
+
+      - name: Collect Windows portable binary
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          rel="src-tauri/target/${{ matrix.target }}/release"
+          if [ -f "$rel/Opinion Insights Browser.exe" ]; then
+            cp -v "$rel/Opinion Insights Browser.exe" "staging/Opinion-Insights-Browser-portable-${{ matrix.label }}.exe"
+          elif [ -f "$rel/opinion-insights-browser.exe" ]; then
+            cp -v "$rel/opinion-insights-browser.exe" "staging/Opinion-Insights-Browser-portable-${{ matrix.label }}.exe"
+          fi
+          ls -la staging/
+
+      - name: Upload to workflow artifacts (intermediate)
+        uses: actions/upload-artifact@v4
+        with:
+          name: opinion-insights-browser-${{ matrix.label }}
+          path: staging/*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    name: publish release
+    steps:
+      - name: Resolve tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download every per-platform artifact
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List collected bundles
+        run: ls -la dist/
+
+      - name: Create / update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: Opinion Insights Browser ${{ steps.tag.outputs.tag }}
+          draft: false
+          prerelease: false
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+          body: |
+            ## Opinion Insights Antidetect Browser ${{ steps.tag.outputs.tag }}
+
+            ### ✨ What's New & Highlights
+            - Automatic in-app update support with Ed25519 cryptographic signature verification.
+            - Enhanced multi-tenant isolation, proxy routing, and spreadsheet-driven batch provisioning.
+            - **100% Data Preservation Guarantee**: Upgrading preserves all existing browser profiles, cookies, proxies, extensions, and fingerprints intact.
+
+            ### 📦 Download & Install
+            * **Windows (Recommended)**: Download `Opinion-Insights-Browser_..._x64-setup.exe` or `.nsis.zip` (for automatic in-app updates).
+            * **Windows Portable**: `Opinion-Insights-Browser-portable-win-x64.exe` (run without installation).
+            * **macOS**: `.dmg` package (Apple Silicon).
+            * **Linux**: `.AppImage` or `.deb`.
+          files: dist/*

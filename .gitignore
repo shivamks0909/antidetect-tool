@@ -1,0 +1,40 @@
+node_modules
+
+# build output — regenerated, keeps diffs readable
+dist/
+ui-kit/dist/
+ui-kit/node_modules/
+/src-tauri/target
+src-tauri/target/
+src-tauri/gen/
+
+# signing keys
+.tauri/*.key
+.tauri/*.key.pub
+
+# large binaries — never commit these
+*.exe
+*.msi
+*.dmg
+*.AppImage
+*.deb
+*.rpm
+
+# large images
+*.png
+
+# environment / secrets
+.env
+.env.*
+!.env.example
+
+# scratch / temp
+scratch/
+launcher_err.txt
+launcher_out.txt
+vite.config.ts.timestamp-*
+release-portable/
+
+# sdks / runtimes
+sdks/
+shardx-launcher/runtime/
