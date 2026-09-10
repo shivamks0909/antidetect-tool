@@ -8,9 +8,9 @@ ui-kit/node_modules/
 src-tauri/target/
 src-tauri/gen/
 
-# signing keys
+# signing keys — private key must never be committed
 .tauri/*.key
-.tauri/*.key.pub
+# keep .pub files (public key is safe to commit)
 
 # large binaries — never commit these
 *.exe

@@ -75,6 +75,18 @@ jobs:
             librsvg2-dev \
             libssl-dev \
             patchelf
+      - name: Validate version sync
+        shell: bash
+        run: |
+          TAG_VERSION="${GITHUB_REF#refs/tags/v}"
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          TAURI_VERSION=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          echo "Tag: $TAG_VERSION | package.json: $PKG_VERSION | tauri.conf.json: $TAURI_VERSION"
+          if [ "$TAG_VERSION" != "$PKG_VERSION" ] || [ "$TAG_VERSION" != "$TAURI_VERSION" ]; then
+            echo "::error::Version mismatch! Tag=$TAG_VERSION, package.json=$PKG_VERSION, tauri.conf.json=$TAURI_VERSION"
+            exit 1
+          fi
+          echo "All versions match: $TAG_VERSION"
 
       - name: npm install
         run: npm ci
