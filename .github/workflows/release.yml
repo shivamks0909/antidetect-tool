@@ -1,41 +1,74 @@
-# Build the Opinion Insights Browser desktop app on GitHub-hosted runners,
-# sign update packages with Ed25519 private key, generate latest.json for auto-updates,
-# and attach all distributables to a GitHub Release.
+﻿# Opinion Insights Browser — Self-Hosted Update Pipeline
+# Triggers on push to master. Only publishes when version changes.
+# Build → Sign → SFTP Upload → Publish Metadata → Verify
 
 name: Release
 
 on:
   push:
-    tags:
-      - 'v*'
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: 'Tag to publish (e.g. v2.0.2). Required for manual runs.'
-        required: true
+    branches: [master]
+  workflow_dispatch: # Manual trigger
 
 permissions:
-  contents: write # needed to create / attach assets to releases
+  contents: read
+
+env:
+  UPDATE_SERVER_HOST: ${{ secrets.UPDATE_SERVER_HOST }}
+  UPDATE_SERVER_USERNAME: ${{ secrets.UPDATE_SERVER_USERNAME }}
+  UPDATE_SERVER_PATH: ${{ secrets.UPDATE_SERVER_PATH }}
 
 jobs:
+  check-version:
+    runs-on: ubuntu-latest
+    name: Check if version changed
+    outputs:
+      should_build: ${{ steps.compare.outputs.should_build }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read new version
+        id: version
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "New version: $VERSION"
+
+      - name: Fetch current published version
+        id: current
+        run: |
+          CURRENT=$(curl -s -o /dev/null -w "%{http_code}" \
+            "https://updates.opinioninsights.in/update?current_version=0.0.0&target=windows&arch=x86_64")
+          # If endpoint returns 200, extract version from response
+          RESPONSE=$(curl -s "https://updates.opinioninsights.in/update?current_version=0.0.0&target=windows&arch=x86_64")
+          if [ "$CURRENT" = "200" ]; then
+            PUBLISHED=$(echo "$RESPONSE" | jq -r '.version // "0.0.0"')
+            echo "published=$PUBLISHED" >> "$GITHUB_OUTPUT"
+            echo "Published version: $PUBLISHED"
+          else
+            echo "published=0.0.0" >> "$GITHUB_OUTPUT"
+            echo "No published version found (HTTP $CURRENT)"
+          fi
+
+      - name: Compare versions
+        id: compare
+        run: |
+          NEW="${{ steps.version.outputs.version }}"
+          OLD="${{ steps.current.outputs.published }}"
+          if [ "$NEW" != "$OLD" ]; then
+            echo "Version changed: $OLD → $NEW"
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Version unchanged ($NEW). Skipping build."
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          fi
+
   build:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            label: win-x64
-          - os: macos-14
-            target: aarch64-apple-darwin
-            label: mac-arm64
-          - os: ubuntu-22.04
-            target: x86_64-unknown-linux-gnu
-            label: linux-x64
-
-    runs-on: ${{ matrix.os }}
-    name: build (${{ matrix.label }})
-
+    needs: check-version
+    if: needs.check-version.outputs.should_build == 'true'
+    runs-on: windows-latest
+    name: Build Windows x64
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -49,131 +82,204 @@ jobs:
             package-lock.json
             ui-kit/package-lock.json
 
-      - name: Set up Rust (stable, ${{ matrix.target }})
+      - name: Set up Rust (stable)
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: x86_64-pc-windows-msvc
 
-      - name: Cache Cargo registry + build target
+      - name: Cache Cargo
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             src-tauri/target
-          key: ${{ matrix.label }}-cargo-${{ hashFiles('src-tauri/Cargo.lock') }}
-          restore-keys: |
-            ${{ matrix.label }}-cargo-
+          key: win-x64-cargo-${{ hashFiles('src-tauri/Cargo.lock') }}
+          restore-keys: win-x64-cargo-
 
-      - name: Install Linux build deps
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libwebkit2gtk-4.1-dev \
-            libayatana-appindicator3-dev \
-            librsvg2-dev \
-            libssl-dev \
-            patchelf
       - name: Validate version sync
         shell: bash
         run: |
-          TAG_VERSION="${GITHUB_REF#refs/tags/v}"
           PKG_VERSION=$(node -p "require('./package.json').version")
           TAURI_VERSION=$(node -p "require('./src-tauri/tauri.conf.json').version")
-          echo "Tag: $TAG_VERSION | package.json: $PKG_VERSION | tauri.conf.json: $TAURI_VERSION"
-          if [ "$TAG_VERSION" != "$PKG_VERSION" ] || [ "$TAG_VERSION" != "$TAURI_VERSION" ]; then
-            echo "::error::Version mismatch! Tag=$TAG_VERSION, package.json=$PKG_VERSION, tauri.conf.json=$TAURI_VERSION"
+          echo "package.json: $PKG_VERSION | tauri.conf.json: $TAURI_VERSION"
+          if [ "$PKG_VERSION" != "$TAURI_VERSION" ]; then
+            echo "::error::Version mismatch! package.json=$PKG_VERSION tauri.conf.json=$TAURI_VERSION"
             exit 1
           fi
-          echo "All versions match: $TAG_VERSION"
 
       - name: npm install
         run: npm ci
 
-      - name: Build Tauri Bundle & Generate Updater Packages
+      - name: Build Tauri (Windows x64)
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        run: npx tauri build --target ${{ matrix.target }}
+        run: npx tauri build --target x86_64-pc-windows-msvc
 
-      - name: Collect bundles & updater artifacts
+      - name: Find updater artifacts
+        id: artifacts
         shell: bash
         run: |
-          mkdir -p staging
-          # Collect all installers, updaters (.zip), signatures (.sig), and metadata
-          find src-tauri/target/${{ matrix.target }}/release/bundle \
-            -type f \
-            \( -name '*.dmg' -o -name '*.app.tar.gz' \
-               -o -name '*.msi' -o -name '*.exe' \
-               -o -name '*.zip' -o -name '*.sig' \
-               -o -name 'latest.json' \
-               -o -name '*.AppImage' -o -name '*.deb' -o -name '*.rpm' \) \
-            -exec cp -v {} staging/ \;
-          ls -la staging/
+          BUNDLE_DIR="src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis"
+          # Find the .nsis.zip updater artifact
+          NSIS_ZIP=$(find "$BUNDLE_DIR" -name "*.nsis.zip" -type f | head -1)
+          NSIS_SIG=$(find "$BUNDLE_DIR" -name "*.nsis.zip.sig" -type f | head -1)
+          INSTALLER=$(find "$BUNDLE_DIR" -name "*.exe" -type f | head -1)
 
-      - name: Collect Windows portable binary
-        if: runner.os == 'Windows'
-        shell: bash
-        run: |
-          rel="src-tauri/target/${{ matrix.target }}/release"
-          if [ -f "$rel/Opinion Insights Browser.exe" ]; then
-            cp -v "$rel/Opinion Insights Browser.exe" "staging/Opinion-Insights-Browser-portable-${{ matrix.label }}.exe"
-          elif [ -f "$rel/opinion-insights-browser.exe" ]; then
-            cp -v "$rel/opinion-insights-browser.exe" "staging/Opinion-Insights-Browser-portable-${{ matrix.label }}.exe"
+          echo "nsis_zip=$NSIS_ZIP" >> "$GITHUB_OUTPUT"
+          echo "nsis_sig=$NSIS_SIG" >> "$GITHUB_OUTPUT"
+          echo "installer=$INSTALLER" >> "$GITHUB_OUTPUT"
+
+          echo "Updater ZIP: $NSIS_ZIP"
+          echo "Signature: $NSIS_SIG"
+          echo "Installer: $INSTALLER"
+
+          # Read signature content
+          if [ -f "$NSIS_SIG" ]; then
+            SIG_CONTENT=$(cat "$NSIS_SIG" | tr -d '\n')
+            echo "signature=$SIG_CONTENT" >> "$GITHUB_OUTPUT"
+            echo "Signature: $SIG_CONTENT"
           fi
-          ls -la staging/
 
-      - name: Upload to workflow artifacts (intermediate)
+      - name: Upload updater artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: opinion-insights-browser-${{ matrix.label }}
-          path: staging/*
+          name: updater-artifacts
+          path: |
+            ${{ steps.artifacts.outputs.nsis_zip }}
+            ${{ steps.artifacts.outputs.nsis_sig }}
+            ${{ steps.artifacts.outputs.installer }}
           if-no-files-found: error
 
-  release:
-    needs: build
+  publish:
+    needs: [check-version, build]
+    if: needs.check-version.outputs.should_build == 'true'
     runs-on: ubuntu-latest
-    name: publish release
+    name: Publish to update server
     steps:
-      - name: Resolve tag
-        id: tag
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Download every per-platform artifact
+      - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
+          name: updater-artifacts
           path: dist
-          merge-multiple: true
 
-      - name: List collected bundles
+      - name: List artifacts
         run: ls -la dist/
 
-      - name: Create / update GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.tag.outputs.tag }}
-          name: Opinion Insights Browser ${{ steps.tag.outputs.tag }}
-          draft: false
-          prerelease: false
-          fail_on_unmatched_files: true
-          generate_release_notes: true
-          body: |
-            ## Opinion Insights Antidetect Browser ${{ steps.tag.outputs.tag }}
+      - name: Read signature
+        id: sig
+        run: |
+          SIG_FILE=$(find dist/ -name "*.nsis.zip.sig" | head -1)
+          if [ -f "$SIG_FILE" ]; then
+            SIGNATURE=$(cat "$SIG_FILE" | tr -d '\n')
+            echo "signature=$SIGNATURE" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::No signature file found"
+            echo "signature=" >> "$GITHUB_OUTPUT"
+          fi
 
-            ### ✨ What's New & Highlights
-            - Automatic in-app update support with Ed25519 cryptographic signature verification.
-            - Enhanced multi-tenant isolation, proxy routing, and spreadsheet-driven batch provisioning.
-            - **100% Data Preservation Guarantee**: Upgrading preserves all existing browser profiles, cookies, proxies, extensions, and fingerprints intact.
+      - name: Upload artifacts via SFTP
+        env:
+          SFTP_HOST: ${{ secrets.UPDATE_SERVER_HOST }}
+          SFTP_USER: ${{ secrets.UPDATE_SERVER_USERNAME }}
+          SFTP_PASS: ${{ secrets.UPDATE_SERVER_PASSWORD }}
+          SFTP_PATH: ${{ secrets.UPDATE_SERVER_PATH }}
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq sshpass
 
-            ### 📦 Download & Install
-            * **Windows (Recommended)**: Download `Opinion-Insights-Browser_..._x64-setup.exe` or `.nsis.zip` (for automatic in-app updates).
-            * **Windows Portable**: `Opinion-Insights-Browser-portable-win-x64.exe` (run without installation).
-            * **macOS**: `.dmg` package (Apple Silicon).
-            * **Linux**: `.AppImage` or `.deb`.
-          files: dist/*
+          NSIS_ZIP=$(find dist/ -name "*.nsis.zip" | head -1)
+          NSIS_SIG=$(find dist/ -name "*.nsis.zip.sig" | head -1)
+          INSTALLER=$(find dist/ -name "*.exe" | head -1)
+          VERSION="${{ needs.check-version.outputs.version }}"
+
+          echo "Uploading artifacts for v$VERSION..."
+
+          # Upload via sshpass + sftp
+          sshpass -e sftp -o StrictHostKeyChecking=no -o BatchMode=no "$SFTP_USER@$SFTP_HOST" <<SFTP_EOF
+          cd $SFTP_PATH/files
+          put $NSIS_ZIP
+          put $NSIS_SIG
+          put $INSTALLER
+          SFTP_EOF
+
+          echo "Artifacts uploaded successfully"
+
+      - name: Update metadata on server
+        env:
+          SFTP_HOST: ${{ secrets.UPDATE_SERVER_HOST }}
+          SFTP_USER: ${{ secrets.UPDATE_SERVER_USERNAME }}
+          SFTP_PASS: ${{ secrets.UPDATE_SERVER_PASSWORD }}
+          SFTP_PATH: ${{ secrets.UPDATE_SERVER_PATH }}
+          SIGNATURE: ${{ steps.sig.outputs.signature }}
+          VERSION: ${{ needs.check-version.outputs.version }}
+        run: |
+          PUB_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          NSIS_ZIP_NAME=$(find dist/ -name "*.nsis.zip" -exec basename {} \;)
+          INSTALLER_NAME=$(find dist/ -name "*.exe" -exec basename {} \;)
+
+          # Generate metadata JSON
+          cat > /tmp/current.json <<EOF
+          {
+            "version": "$VERSION",
+            "notes": "Version $VERSION — Performance improvements and bug fixes.",
+            "pub_date": "$PUB_DATE",
+            "platforms": {
+              "windows-x86_64": {
+                "url": "https://updates.opinioninsights.in/files/$NSIS_ZIP_NAME",
+                "signature": "$SIGNATURE"
+              }
+            }
+          }
+          EOF
+
+          echo "Metadata:"
+          cat /tmp/current.json
+
+          # Upload metadata
+          sshpass -e sftp -o StrictHostKeyChecking=no -o BatchMode=no "$SFTP_USER@$SFTP_HOST" <<SFTP_EOF
+          cd $SFTP_PATH
+          put /tmp/current.json current.json
+          SFTP_EOF
+
+          echo "Metadata published successfully"
+
+      - name: Verify update endpoint
+        run: |
+          VERSION="${{ needs.check-version.outputs.version }}"
+          echo "Verifying endpoint returns update for v$VERSION..."
+
+          # Old version should get the update
+          RESP=$(curl -s -w "\n%{http_code}" \
+            "https://updates.opinioninsights.in/update?current_version=1.0.0&target=windows&arch=x86_64")
+          HTTP_CODE=$(echo "$RESP" | tail -1)
+          BODY=$(echo "$RESP" | head -n -1)
+
+          echo "HTTP: $HTTP_CODE"
+          echo "Body: $BODY"
+
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "::error::Endpoint did not return 200 for old version"
+            exit 1
+          fi
+
+          # Current version should get 204
+          RESP2=$(curl -s -o /dev/null -w "%{http_code}" \
+            "https://updates.opinioninsights.in/update?current_version=$VERSION&target=windows&arch=x86_64")
+
+          if [ "$RESP2" != "204" ]; then
+            echo "::error::Endpoint did not return 204 for current version (got $RESP2)"
+            exit 1
+          fi
+
+          echo "✅ Update endpoint verified: old versions get update, current version gets 204"
+
+      - name: Summary
+        run: |
+          echo "## ✅ Update Published" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Version**: ${{ needs.check-version.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Endpoint**: https://updates.opinioninsights.in/update" >> $GITHUB_STEP_SUMMARY
+          echo "- **Artifacts uploaded**: updater zip, signature, installer" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Installed apps will detect this update on their next periodic check." >> $GITHUB_STEP_SUMMARY

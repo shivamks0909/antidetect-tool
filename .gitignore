@@ -38,3 +38,9 @@ release-portable/
 # sdks / runtimes
 sdks/
 shardx-launcher/runtime/
+
+# Update server - ignore uploaded binaries but track metadata
+server/update/files/
+
+# Update server - ignore uploaded binaries but track metadata
+server/update/files/
