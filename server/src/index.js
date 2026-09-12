@@ -9,14 +9,18 @@ import rateLimit from "express-rate-limit";
 import speakeasy from "speakeasy";
 import QRCode from "qrcode";
 import nodemailer from "nodemailer";
-import { connectDB, getDB, isDBConnected } from "./db.js";
-import { ObjectId } from "mongodb";
+import { connectDB, getDB, isDBConnected, ensureDB } from "./db.js";
 import fs from "fs";
 import path from "path";
 
 dotenv.config();
 
-// ─── SMTP Email Transporter Setup ───
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ MySQL datetime helper Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ JS toISOString() Ã¢â€ â€™ "2026-09-12T02:02:51.523Z" but MySQL DATETIME needs "2026-09-12 02:02:51.523"
+function toMySQLDate(date = new Date()) {
+  return date.toISOString().replace("T", " ").replace("Z", "");
+}
+
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ SMTP Email Transporter Setup Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 let mailTransporter = null;
 if (process.env.SMTP_HOST) {
   mailTransporter = nodemailer.createTransport({
@@ -54,10 +58,10 @@ async function sendResetEmail(toEmail, resetToken) {
       const info = await mailTransporter.sendMail({
         from: process.env.SMTP_FROM || '"Opinion Insights Admin" <no-reply@opinioninsights.com>',
         to: toEmail,
-        subject: "Password Reset Request — Opinion Insights Admin",
+        subject: "Password Reset Request Ã¢â‚¬â€ Opinion Insights Admin",
         html: `
           <div style="font-family: Arial, sans-serif; padding: 20px; color: #333;">
-            <h2>Opinion Insights — Password Reset</h2>
+            <h2>Opinion Insights Ã¢â‚¬â€ Password Reset</h2>
             <p>You requested a password reset for your admin account.</p>
             <p>Click the link below to set your new password (valid for 15 minutes, one-time use):</p>
             <p><a href="${resetLink}" style="background-color: #00bfa5; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px; font-weight: bold;">Reset Password</a></p>
@@ -84,7 +88,7 @@ const app = express();
 const PORT = process.env.PORT || 5000;
 const JWT_SECRET = process.env.JWT_SECRET || "opinion_insights_super_secret_jwt_key_2026_production";
 
-// ─── Security Headers & Strict CORS ───
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Security Headers & Strict CORS Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 app.use(helmet());
 
 const isProduction = process.env.NODE_ENV === "production";
@@ -103,7 +107,6 @@ const allowedOrigins = [
 app.use(
   cors({
     origin: (origin, callback) => {
-      // Allow requests with no origin (e.g. mobile apps, curl, desktop native clients)
       if (
         !origin ||
         allowedOrigins.includes(origin) ||
@@ -133,28 +136,36 @@ app.use((req, res, next) => {
   next();
 });
 
-// Auto-connect MongoDB on incoming requests (essential for serverless or cold starts)
+// Auto-connect MySQL on incoming requests (essential for serverless or cold starts)
 app.use(async (req, res, next) => {
-  // Let health check handle its own DB status check
   if (req.url === "/api/health" || req.path === "/api/health" || req.url === "/health" || req.path === "/health") {
     try {
       if (!isDBConnected()) await connectDB();
     } catch (_) {}
     return next();
   }
-  try {
-    if (!isDBConnected()) await connectDB();
-    next();
-  } catch (err) {
-    console.error("[DB Middleware Error]", err);
-    res.status(500).json({ error: "Database connection failed", details: err.message });
+
+  const MAX_DB_RETRIES = 3;
+  for (let attempt = 1; attempt <= MAX_DB_RETRIES; attempt++) {
+    try {
+      if (!isDBConnected()) await connectDB();
+      return next();
+    } catch (err) {
+      console.error(`[DB Middleware] Attempt ${attempt}/${MAX_DB_RETRIES} failed:`, err.message);
+      if (attempt < MAX_DB_RETRIES) {
+        const delayMs = Math.min(1000 * Math.pow(2, attempt - 1), 4000);
+        await new Promise(r => setTimeout(r, delayMs));
+        continue;
+      }
+    }
   }
+  res.status(500).json({ error: "Database connection failed", details: "Server could not establish database connection after retries" });
 });
 
-// ─── Rate Limiters ───
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Rate Limiters Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 const loginRateLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100, // 100 max attempts for dev/test verification
+  windowMs: 15 * 60 * 1000,
+  max: 100,
   skip: (req) => req.headers["x-audit-test"] === "true",
   message: { error: "Too many login attempts. Please try again after 15 minutes." },
   standardHeaders: true,
@@ -162,12 +173,12 @@ const loginRateLimiter = rateLimit({
 });
 
 const forgotPasswordLimiter = rateLimit({
-  windowMs: 60 * 60 * 1000, // 1 hour
+  windowMs: 60 * 60 * 1000,
   max: 5,
   message: { error: "Too many password reset requests. Please try again later." },
 });
 
-// ─── Password Policy Validator ───
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Password Policy Validator Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 export function validatePasswordPolicy(password, userEmail = "", fullName = "") {
   if (password.length < 12) {
     return "Password must be at least 12 characters long.";
@@ -190,7 +201,7 @@ export function validatePasswordPolicy(password, userEmail = "", fullName = "") 
   return null;
 }
 
-// ─── Audit Logger (Sanitized) ───
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Audit Logger (Sanitized) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 async function recordAuditLog(actorId, actorEmail, action, targetId, details = {}) {
   try {
     const db = getDB();
@@ -203,20 +214,16 @@ async function recordAuditLog(actorId, actorEmail, action, targetId, details = {
     delete sanitizedDetails.recoveryCode;
     delete sanitizedDetails.secret;
 
-    await db.collection("audit_logs").insertOne({
-      actorId: actorId || "system",
-      actorEmail: actorEmail || "system",
-      action,
-      targetId: targetId || null,
-      details: sanitizedDetails,
-      timestamp: new Date().toISOString(),
-    });
+    await db.query(
+      "INSERT INTO audit_logs (actorId, actorEmail, action, targetId, details, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
+      [actorId || "system", actorEmail || "system", action, targetId || null, JSON.stringify(sanitizedDetails), toMySQLDate()]
+    );
   } catch (err) {
     console.error("[Audit] Failed to log event:", err);
   }
 }
 
-// ─── Session Helpers ───
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Session Helpers Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 function hashToken(token) {
   return crypto.createHash("sha256").update(token).digest("hex");
 }
@@ -224,76 +231,78 @@ function hashToken(token) {
 async function createSession(userId, userEmail, token, userAgent = "", ip = "") {
   const db = getDB();
   const tokenHashed = hashToken(token);
-  const session = {
-    userId,
-    userEmail,
-    tokenHash: tokenHashed,
-    userAgent: userAgent || "Unknown Device",
-    ip: ip || "127.0.0.1",
-    createdAt: new Date().toISOString(),
-    lastActiveAt: new Date().toISOString(),
-    isRevoked: false,
-  };
-  const result = await db.collection("active_sessions").insertOne(session);
-  return result.insertedId.toString();
+  const [result] = await db.query(
+    "INSERT INTO active_sessions (userId, userEmail, tokenHash, userAgent, ip, createdAt, lastActiveAt, isRevoked) VALUES (?, ?, ?, ?, ?, ?, ?, false)",
+    [parseInt(userId), userEmail, tokenHashed, userAgent || "Unknown Device", ip || "127.0.0.1", toMySQLDate(), toMySQLDate()]
+  );
+  return result.insertId.toString();
 }
 
 async function revokeSession(token) {
   const db = getDB();
   const tokenHashed = hashToken(token);
-  await db.collection("active_sessions").updateMany(
-    { tokenHash: tokenHashed },
-    { $set: { isRevoked: true, revokedAt: new Date().toISOString() } }
+  await db.query(
+    "UPDATE active_sessions SET isRevoked = true, revokedAt = ? WHERE tokenHash = ?",
+    [toMySQLDate(), tokenHashed]
   );
 }
 
 async function revokeAllUserSessions(userId, keepCurrentToken = null) {
   const db = getDB();
-  const query = { userId, isRevoked: false };
+  let sql = "UPDATE active_sessions SET isRevoked = true, revokedAt = ? WHERE userId = ? AND isRevoked = false";
+  const params = [toMySQLDate(), parseInt(userId)];
   if (keepCurrentToken) {
-    query.tokenHash = { $ne: hashToken(keepCurrentToken) };
+    sql += " AND tokenHash != ?";
+    params.push(hashToken(keepCurrentToken));
   }
-  await db.collection("active_sessions").updateMany(query, {
-    $set: { isRevoked: true, revokedAt: new Date().toISOString() },
-  });
+  await db.query(sql, params);
 }
 
-// ─── Authentication Middleware ───
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Authentication Middleware Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 export async function authenticateToken(req, res, next) {
   const authHeader = req.headers["authorization"];
   const token = authHeader && authHeader.split(" ")[1];
   if (!token) return res.status(401).json({ error: "Missing authorization token." });
 
+  let db;
+  try {
+    db = await ensureDB();
+  } catch (dbErr) {
+    console.error("[Auth] DB not available during auth:", dbErr.message);
+    return res.status(503).json({ error: "Service temporarily unavailable. Please try again." });
+  }
+
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
-    const db = getDB();
 
     // Verify session is active in database
     const tokenHashed = hashToken(token);
-    const session = await db.collection("active_sessions").findOne({ tokenHash: tokenHashed });
+    const [sessions] = await db.query("SELECT * FROM active_sessions WHERE tokenHash = ? LIMIT 1", [tokenHashed]);
+    const session = sessions[0];
     if (!session || session.isRevoked) {
       return res.status(401).json({ error: "Session expired or revoked. Please sign in again." });
     }
 
     // Verify user exists and is active
-    const user = await db.collection("users").findOne({ _id: new ObjectId(decoded.id) });
+    const [users] = await db.query("SELECT * FROM users WHERE id = ? LIMIT 1", [parseInt(decoded.id)]);
+    const user = users[0];
     if (!user || !user.isActive) {
       // Auto-revoke session if account disabled
-      await db.collection("active_sessions").updateMany(
-        { userId: decoded.id },
-        { $set: { isRevoked: true, revokedAt: new Date().toISOString() } }
+      await db.query(
+        "UPDATE active_sessions SET isRevoked = true, revokedAt = ? WHERE userId = ?",
+        [toMySQLDate(), parseInt(decoded.id)]
       );
       return res.status(403).json({ error: "Your account has been deactivated. Please contact administrator." });
     }
 
-    // Touch last active
-    db.collection("active_sessions").updateOne(
-      { _id: session._id },
-      { $set: { lastActiveAt: new Date().toISOString() } }
+    // Touch last active (fire-and-forget, never block auth)
+    db.query(
+      "UPDATE active_sessions SET lastActiveAt = ? WHERE id = ?",
+      [toMySQLDate(), session.id]
     ).catch(() => {});
 
     req.user = {
-      id: user._id.toString(),
+      id: String(user.id),
       email: user.email,
       fullName: user.fullName,
       role: user.role,
@@ -302,7 +311,11 @@ export async function authenticateToken(req, res, next) {
     req.token = token;
     next();
   } catch (err) {
-    return res.status(401).json({ error: "Invalid or expired token." });
+    if (err.name === "JsonWebTokenError" || err.name === "TokenExpiredError") {
+      return res.status(401).json({ error: "Invalid or expired token." });
+    }
+    console.error("[Auth] Unexpected error during token verification:", err.message);
+    return res.status(503).json({ error: "Service temporarily unavailable. Please try again." });
   }
 }
 
@@ -313,32 +326,32 @@ export function requireAdmin(req, res, next) {
   next();
 }
 
-// ─── Health Check ───
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Health Check Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 const healthHandler = async (req, res) => {
-  let mongoStatus = "disconnected";
+  let mysqlStatus = "disconnected";
   try {
     if (!isDBConnected()) {
       await connectDB();
     }
     const db = getDB();
-    const stats = await db.command({ ping: 1 });
-    mongoStatus = stats.ok === 1 ? "connected" : "disconnected";
+    await db.query("SELECT 1 AS ok");
+    mysqlStatus = "connected";
   } catch (err) {
-    mongoStatus = `error: ${err.message}`;
+    mysqlStatus = `error: ${err.message}`;
   }
 
   res.json({
     status: "online",
     service: "Opinion Insights Backend API",
-    mongodb: mongoStatus,
-    timestamp: new Date().toISOString(),
+    mysql: mysqlStatus,
+    timestamp: toMySQLDate(),
   });
 };
 
 app.get("/api/health", healthHandler);
 app.get("/health", healthHandler);
 
-// ─── Auto-Update Endpoints ───
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Auto-Update Endpoints Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 const updaterManifestHandler = async (req, res) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
@@ -347,9 +360,10 @@ const updaterManifestHandler = async (req, res) => {
 
   try {
     const db = getDB();
-    const manifestDoc = await db.collection("system_config").findOne({ key: "latest_release_manifest" });
-    if (manifestDoc && manifestDoc.manifest) {
-      return res.json(manifestDoc.manifest);
+    const [rows] = await db.query("SELECT manifest FROM system_config WHERE configKey = ?", ["latest_release_manifest"]);
+    if (rows.length > 0 && rows[0].manifest) {
+      const manifest = typeof rows[0].manifest === "string" ? JSON.parse(rows[0].manifest) : rows[0].manifest;
+      return res.json(manifest);
     }
   } catch (dbErr) {
     console.warn("[Updater] DB lookup skipped:", dbErr.message);
@@ -389,16 +403,9 @@ app.post("/api/updates/publish", authenticateToken, requireAdmin, async (req, re
       return res.status(400).json({ error: "Invalid manifest payload: version required" });
     }
     const db = getDB();
-    await db.collection("system_config").updateOne(
-      { key: "latest_release_manifest" },
-      {
-        $set: {
-          manifest,
-          updatedAt: new Date().toISOString(),
-          publishedBy: req.user.email || req.user.id,
-        },
-      },
-      { upsert: true }
+    await db.query(
+      "INSERT INTO system_config (configKey, manifest, updatedAt, publishedBy) VALUES (?, ?, ?, ?) ON DUPLICATE KEY UPDATE manifest = VALUES(manifest), updatedAt = VALUES(updatedAt), publishedBy = VALUES(publishedBy)",
+      ["latest_release_manifest", JSON.stringify(manifest), toMySQLDate(), req.user.email || req.user.id]
     );
     await recordAuditLog(req.user.id, req.user.email, "release_manifest_published", manifest.version, {
       version: manifest.version,
@@ -409,7 +416,7 @@ app.post("/api/updates/publish", authenticateToken, requireAdmin, async (req, re
   }
 });
 
-// ─── Authentication Endpoints ───
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Authentication Endpoints Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 
 app.post("/api/auth/login", loginRateLimiter, async (req, res) => {
   const { email, password } = req.body;
@@ -419,8 +426,8 @@ app.post("/api/auth/login", loginRateLimiter, async (req, res) => {
 
   try {
     const db = getDB();
-    const usersCol = db.collection("users");
-    const user = await usersCol.findOne({ email: email.toLowerCase().trim() });
+    const [users] = await db.query("SELECT * FROM users WHERE email = ?", [email.toLowerCase().trim()]);
+    const user = users[0];
 
     if (!user) {
       await recordAuditLog("system", email, "LOGIN_FAILED", null, { reason: "User not found" });
@@ -428,7 +435,7 @@ app.post("/api/auth/login", loginRateLimiter, async (req, res) => {
     }
 
     if (!user.isActive) {
-      await recordAuditLog(user._id.toString(), user.email, "LOGIN_BLOCKED", null, { reason: "Account disabled" });
+      await recordAuditLog(String(user.id), user.email, "LOGIN_BLOCKED", null, { reason: "Account disabled" });
       return res.status(403).json({ error: "Your account has been deactivated. Please contact your administrator." });
     }
 
@@ -440,7 +447,7 @@ app.post("/api/auth/login", loginRateLimiter, async (req, res) => {
         ? `${remainingSec} second${remainingSec === 1 ? "" : "s"}`
         : `${Math.ceil(remainingSec / 60)} minute${Math.ceil(remainingSec / 60) === 1 ? "" : "s"}`;
 
-      await recordAuditLog(user._id.toString(), user.email, "LOGIN_LOCKED_OUT", null, { remainingSec });
+      await recordAuditLog(String(user.id), user.email, "LOGIN_LOCKED_OUT", null, { remainingSec });
       return res.status(429).json({
         error: `Account temporarily locked due to repeated failed logins. Try again in ${timeStr}.`,
         remainingSeconds: remainingSec,
@@ -450,30 +457,29 @@ app.post("/api/auth/login", loginRateLimiter, async (req, res) => {
     const passwordValid = await bcrypt.compare(password, user.passwordHash);
     if (!passwordValid) {
       const failedAttempts = (user.failedAttempts || 0) + 1;
-      const updates = { failedAttempts };
+      const updateFields = { failedAttempts };
       if (failedAttempts >= 5) {
-        // Progressive backoff: 1st lockout is 15s, then increases on subsequent failures (30s, 60s, 120s, 300s, 900s)
         const progressiveLockouts = [15, 30, 60, 120, 300, 900];
         const step = Math.min(failedAttempts - 5, progressiveLockouts.length - 1);
         const lockoutSeconds = progressiveLockouts[step];
-        updates.lockoutUntil = new Date(Date.now() + lockoutSeconds * 1000).toISOString();
+        updateFields.lockoutUntil = toMySQLDate(new Date(Date.now() + lockoutSeconds * 1000));
       }
-      await usersCol.updateOne({ _id: user._id }, { $set: updates });
-      await recordAuditLog(user._id.toString(), user.email, "LOGIN_FAILED", null, { attempts: failedAttempts });
+      await db.query("UPDATE users SET failedAttempts = ?, lockoutUntil = ? WHERE id = ?", [updateFields.failedAttempts, updateFields.lockoutUntil || null, user.id]);
+      await recordAuditLog(String(user.id), user.email, "LOGIN_FAILED", null, { attempts: failedAttempts });
       return res.status(401).json({ error: "Invalid email or password." });
     }
 
     // Reset failed attempts on success
-    await usersCol.updateOne({ _id: user._id }, { $set: { failedAttempts: 0, lockoutUntil: null } });
+    await db.query("UPDATE users SET failedAttempts = 0, lockoutUntil = NULL WHERE id = ?", [user.id]);
 
     // Check 2FA
     if (user.twoFactorEnabled) {
       const tempToken = jwt.sign(
-        { id: user._id.toString(), email: user.email, is2FAPending: true },
+        { id: String(user.id), email: user.email, is2FAPending: true },
         JWT_SECRET,
         { expiresIn: "5m" }
       );
-      await recordAuditLog(user._id.toString(), user.email, "LOGIN_2FA_PROMPTED", null);
+      await recordAuditLog(String(user.id), user.email, "LOGIN_2FA_PROMPTED", null);
       return res.json({
         success: true,
         require2FA: true,
@@ -482,24 +488,24 @@ app.post("/api/auth/login", loginRateLimiter, async (req, res) => {
       });
     }
 
-    // Issue session token with unique JTI to prevent token collision across rapid logins
+    // Issue session token
     const token = jwt.sign(
-      { id: user._id.toString(), email: user.email, role: user.role, jti: crypto.randomUUID() },
+      { id: String(user.id), email: user.email, role: user.role, jti: crypto.randomUUID() },
       JWT_SECRET,
       { expiresIn: "12h" }
     );
 
     const userAgent = req.headers["user-agent"] || "";
     const ip = req.ip || req.socket.remoteAddress || "";
-    await createSession(user._id.toString(), user.email, token, userAgent, ip);
+    await createSession(String(user.id), user.email, token, userAgent, ip);
 
-    await recordAuditLog(user._id.toString(), user.email, "LOGIN_SUCCESS", null, { role: user.role });
+    await recordAuditLog(String(user.id), user.email, "LOGIN_SUCCESS", null, { role: user.role });
 
     res.json({
       success: true,
       token,
       user: {
-        id: user._id.toString(),
+        id: String(user.id),
         email: user.email,
         full_name: user.fullName,
         role: user.role,
@@ -527,7 +533,8 @@ app.post("/api/auth/login/2fa", loginRateLimiter, async (req, res) => {
     }
 
     const db = getDB();
-    const user = await db.collection("users").findOne({ _id: new ObjectId(decoded.id) });
+    const [users] = await db.query("SELECT * FROM users WHERE id = ?", [parseInt(decoded.id)]);
+    const user = users[0];
     if (!user || !user.isActive || !user.twoFactorEnabled) {
       return res.status(403).json({ error: "2FA authentication failed or account disabled." });
     }
@@ -541,38 +548,37 @@ app.post("/api/auth/login/2fa", loginRateLimiter, async (req, res) => {
 
     // Check recovery codes if TOTP failed
     let usedRecovery = false;
-    if (!codeValid && user.recoveryCodes && Array.isArray(user.recoveryCodes)) {
-      for (const hashedRec of user.recoveryCodes) {
+    if (!codeValid && user.recoveryCodes) {
+      const recoveryCodes = Array.isArray(user.recoveryCodes) ? user.recoveryCodes : JSON.parse(user.recoveryCodes || "[]");
+      for (const hashedRec of recoveryCodes) {
         if (await bcrypt.compare(code.trim(), hashedRec)) {
           codeValid = true;
           usedRecovery = true;
-          // Burn recovery code
-          await db.collection("users").updateOne(
-            { _id: user._id },
-            { $pull: { recoveryCodes: hashedRec } }
-          );
+          // Burn recovery code - filter and update
+          const remainingCodes = recoveryCodes.filter(rc => rc !== hashedRec);
+          await db.query("UPDATE users SET recoveryCodes = ? WHERE id = ?", [JSON.stringify(remainingCodes), user.id]);
           break;
         }
       }
     }
 
     if (!codeValid) {
-      await recordAuditLog(user._id.toString(), user.email, "LOGIN_2FA_FAILED", null);
+      await recordAuditLog(String(user.id), user.email, "LOGIN_2FA_FAILED", null);
       return res.status(401).json({ error: "Invalid 2FA code or recovery code." });
     }
 
     const token = jwt.sign(
-      { id: user._id.toString(), email: user.email, role: user.role, jti: crypto.randomUUID() },
+      { id: String(user.id), email: user.email, role: user.role, jti: crypto.randomUUID() },
       JWT_SECRET,
       { expiresIn: "12h" }
     );
 
     const userAgent = req.headers["user-agent"] || "";
     const ip = req.ip || req.socket.remoteAddress || "";
-    await createSession(user._id.toString(), user.email, token, userAgent, ip);
+    await createSession(String(user.id), user.email, token, userAgent, ip);
 
     await recordAuditLog(
-      user._id.toString(),
+      String(user.id),
       user.email,
       "LOGIN_2FA_SUCCESS",
       null,
@@ -583,7 +589,7 @@ app.post("/api/auth/login/2fa", loginRateLimiter, async (req, res) => {
       success: true,
       token,
       user: {
-        id: user._id.toString(),
+        id: String(user.id),
         email: user.email,
         full_name: user.fullName,
         role: user.role,
@@ -633,26 +639,23 @@ app.post("/api/auth/forgot-password", forgotPasswordLimiter, async (req, res) =>
 
   try {
     const db = getDB();
-    const user = await db.collection("users").findOne({ email: email.toLowerCase().trim() });
+    const [users] = await db.query("SELECT * FROM users WHERE email = ?", [email.toLowerCase().trim()]);
+    const user = users[0];
 
     if (user && user.isActive) {
       // Invalidate existing reset tokens for this user
-      await db.collection("password_resets").deleteMany({ userId: user._id.toString() });
+      await db.query("DELETE FROM password_resets WHERE userId = ?", [String(user.id)]);
 
       const rawToken = crypto.randomBytes(32).toString("hex");
-      const tokenHash = hashToken(rawToken);
+      const tokenHashed = hashToken(rawToken);
 
-      await db.collection("password_resets").insertOne({
-        userId: user._id.toString(),
-        email: user.email,
-        tokenHash,
-        expiresAt: new Date(Date.now() + 15 * 60 * 1000).toISOString(), // 15 mins
-        isUsed: false,
-        createdAt: new Date().toISOString(),
-      });
+      await db.query(
+        "INSERT INTO password_resets (userId, email, tokenHash, expiresAt, isUsed) VALUES (?, ?, ?, ?, false)",
+        [String(user.id), user.email, tokenHashed, toMySQLDate(new Date(Date.now() + 15 * 60 * 1000))]
+      );
 
       await sendResetEmail(user.email, rawToken);
-      await recordAuditLog(user._id.toString(), user.email, "PASSWORD_RESET_REQUESTED", null);
+      await recordAuditLog(String(user.id), user.email, "PASSWORD_RESET_REQUESTED", null);
       console.log(`[Security] Password reset email sent for ${user.email}`);
     }
 
@@ -676,8 +679,9 @@ app.post("/api/auth/reset-password", async (req, res) => {
 
   try {
     const db = getDB();
-    const tokenHash = hashToken(token);
-    const resetRecord = await db.collection("password_resets").findOne({ tokenHash });
+    const tokenHashed = hashToken(token);
+    const [resets] = await db.query("SELECT * FROM password_resets WHERE tokenHash = ? LIMIT 1", [tokenHashed]);
+    const resetRecord = resets[0];
 
     if (!resetRecord || resetRecord.isUsed || new Date(resetRecord.expiresAt) < new Date()) {
       return res.status(400).json({ error: "Invalid, expired, or already used password reset link." });
@@ -687,15 +691,15 @@ app.post("/api/auth/reset-password", async (req, res) => {
     const passwordHash = await bcrypt.hash(newPassword, salt);
 
     // Update password
-    await db.collection("users").updateOne(
-      { _id: new ObjectId(resetRecord.userId) },
-      { $set: { passwordHash, failedAttempts: 0, lockoutUntil: null, updatedAt: new Date().toISOString() } }
+    await db.query(
+      "UPDATE users SET passwordHash = ?, failedAttempts = 0, lockoutUntil = NULL, updatedAt = ? WHERE id = ?",
+      [passwordHash, toMySQLDate(), parseInt(resetRecord.userId)]
     );
 
     // Burn token
-    await db.collection("password_resets").updateOne(
-      { _id: resetRecord._id },
-      { $set: { isUsed: true, usedAt: new Date().toISOString() } }
+    await db.query(
+      "UPDATE password_resets SET isUsed = true, usedAt = ? WHERE id = ?",
+      [toMySQLDate(), resetRecord.id]
     );
 
     // Revoke all existing active sessions
@@ -723,7 +727,8 @@ app.post("/api/auth/change-password", authenticateToken, async (req, res) => {
 
   try {
     const db = getDB();
-    const user = await db.collection("users").findOne({ _id: new ObjectId(req.user.id) });
+    const [users] = await db.query("SELECT * FROM users WHERE id = ?", [parseInt(req.user.id)]);
+    const user = users[0];
     const currentValid = await bcrypt.compare(currentPassword, user.passwordHash);
 
     if (!currentValid) {
@@ -734,9 +739,9 @@ app.post("/api/auth/change-password", authenticateToken, async (req, res) => {
     const salt = await bcrypt.genSalt(10);
     const passwordHash = await bcrypt.hash(newPassword, salt);
 
-    await db.collection("users").updateOne(
-      { _id: user._id },
-      { $set: { passwordHash, updatedAt: new Date().toISOString() } }
+    await db.query(
+      "UPDATE users SET passwordHash = ?, updatedAt = ? WHERE id = ?",
+      [passwordHash, toMySQLDate(), user.id]
     );
 
     // Revoke all other active sessions except current
@@ -750,7 +755,7 @@ app.post("/api/auth/change-password", authenticateToken, async (req, res) => {
   }
 });
 
-// ─── 2FA Management (TOTP Setup, Enable, Disable) ───
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ 2FA Management (TOTP Setup, Enable, Disable) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 
 app.post("/api/auth/2fa/setup", authenticateToken, async (req, res) => {
   try {
@@ -761,11 +766,10 @@ app.post("/api/auth/2fa/setup", authenticateToken, async (req, res) => {
 
     const qrCodeUrl = await QRCode.toDataURL(secret.otpauth_url);
 
-    // Store temp secret
     const db = getDB();
-    await db.collection("users").updateOne(
-      { _id: new ObjectId(req.user.id) },
-      { $set: { tempTwoFactorSecret: secret.base32 } }
+    await db.query(
+      "UPDATE users SET tempTwoFactorSecret = ? WHERE id = ?",
+      [secret.base32, parseInt(req.user.id)]
     );
 
     res.json({
@@ -784,7 +788,8 @@ app.post("/api/auth/2fa/enable", authenticateToken, async (req, res) => {
 
   try {
     const db = getDB();
-    const user = await db.collection("users").findOne({ _id: new ObjectId(req.user.id) });
+    const [users] = await db.query("SELECT * FROM users WHERE id = ?", [parseInt(req.user.id)]);
+    const user = users[0];
     if (!user.tempTwoFactorSecret) {
       return res.status(400).json({ error: "No 2FA setup in progress. Initiate setup first." });
     }
@@ -809,17 +814,9 @@ app.post("/api/auth/2fa/enable", authenticateToken, async (req, res) => {
       rawRecoveryCodes.map(async (rc) => bcrypt.hash(rc, 10))
     );
 
-    await db.collection("users").updateOne(
-      { _id: user._id },
-      {
-        $set: {
-          twoFactorEnabled: true,
-          twoFactorSecret: user.tempTwoFactorSecret,
-          recoveryCodes: hashedRecoveryCodes,
-          tempTwoFactorSecret: null,
-          updatedAt: new Date().toISOString(),
-        },
-      }
+    await db.query(
+      "UPDATE users SET twoFactorEnabled = true, twoFactorSecret = ?, recoveryCodes = ?, tempTwoFactorSecret = NULL, updatedAt = ? WHERE id = ?",
+      [user.tempTwoFactorSecret, JSON.stringify(hashedRecoveryCodes), toMySQLDate(), user.id]
     );
 
     await recordAuditLog(req.user.id, req.user.email, "2FA_ENABLED", null);
@@ -842,7 +839,8 @@ app.post("/api/auth/2fa/disable", authenticateToken, async (req, res) => {
 
   try {
     const db = getDB();
-    const user = await db.collection("users").findOne({ _id: new ObjectId(req.user.id) });
+    const [users] = await db.query("SELECT * FROM users WHERE id = ?", [parseInt(req.user.id)]);
+    const user = users[0];
 
     const passwordValid = await bcrypt.compare(currentPassword, user.passwordHash);
     if (!passwordValid) {
@@ -860,16 +858,9 @@ app.post("/api/auth/2fa/disable", authenticateToken, async (req, res) => {
       return res.status(400).json({ error: "Invalid 2FA code." });
     }
 
-    await db.collection("users").updateOne(
-      { _id: user._id },
-      {
-        $set: {
-          twoFactorEnabled: false,
-          twoFactorSecret: null,
-          recoveryCodes: [],
-          updatedAt: new Date().toISOString(),
-        },
-      }
+    await db.query(
+      "UPDATE users SET twoFactorEnabled = false, twoFactorSecret = NULL, recoveryCodes = NULL, updatedAt = ? WHERE id = ?",
+      [toMySQLDate(), user.id]
     );
 
     await recordAuditLog(req.user.id, req.user.email, "2FA_DISABLED", null);
@@ -880,20 +871,19 @@ app.post("/api/auth/2fa/disable", authenticateToken, async (req, res) => {
   }
 });
 
-// ─── Active Sessions Management Endpoints ───
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Active Sessions Management Endpoints Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 
 app.get("/api/admin/sessions", authenticateToken, async (req, res) => {
   try {
     const db = getDB();
     const currentTokenHash = hashToken(req.token);
-    const sessions = await db
-      .collection("active_sessions")
-      .find({ userId: req.user.id, isRevoked: false })
-      .sort({ lastActiveAt: -1 })
-      .toArray();
+    const [sessions] = await db.query(
+      "SELECT * FROM active_sessions WHERE userId = ? AND isRevoked = false ORDER BY lastActiveAt DESC",
+      [parseInt(req.user.id)]
+    );
 
     const formatted = sessions.map((s) => ({
-      id: s._id.toString(),
+      id: String(s.id),
       userAgent: s.userAgent,
       ip: s.ip,
       createdAt: s.createdAt,
@@ -913,9 +903,9 @@ app.post("/api/admin/sessions/revoke", authenticateToken, async (req, res) => {
 
   try {
     const db = getDB();
-    await db.collection("active_sessions").updateOne(
-      { _id: new ObjectId(sessionId), userId: req.user.id },
-      { $set: { isRevoked: true, revokedAt: new Date().toISOString() } }
+    await db.query(
+      "UPDATE active_sessions SET isRevoked = true, revokedAt = ? WHERE id = ? AND userId = ?",
+      [toMySQLDate(), parseInt(sessionId), parseInt(req.user.id)]
     );
     await recordAuditLog(req.user.id, req.user.email, "SESSION_REVOKED", sessionId);
     res.json({ success: true, message: "Session revoked." });
@@ -934,19 +924,25 @@ app.post("/api/admin/sessions/revoke-all", authenticateToken, async (req, res) =
   }
 });
 
-// ─── Admin Users Management (RBAC Protected) ───
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Admin Users Management (RBAC Protected) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 
 app.get("/api/admin/users", authenticateToken, requireAdmin, async (req, res) => {
   try {
     const db = getDB();
-    const users = await db.collection("users").find({}, { projection: { passwordHash: 0, twoFactorSecret: 0, recoveryCodes: 0 } }).toArray();
+    const [users] = await db.query(
+      "SELECT id, email, fullName, role, isActive, twoFactorEnabled, createdAt FROM users"
+    );
     const formatted = await Promise.all(
       users.map(async (u) => {
-        const uId = u._id.toString();
-        const [profilesCount, proxiesCount] = await Promise.all([
-          db.collection("profile_metas").countDocuments({ $or: [{ owner_account_id: uId }, { userId: uId }] }),
-          db.collection("user_proxies").countDocuments({ $or: [{ owner_account_id: uId }, { userId: uId }] }),
-        ]);
+        const uId = String(u.id);
+        const [[profilesCountRow]] = await db.query(
+          "SELECT COUNT(*) as cnt FROM profile_metas WHERE owner_account_id = ? OR userId = ?",
+          [uId, uId]
+        );
+        const [[proxiesCountRow]] = await db.query(
+          "SELECT COUNT(*) as cnt FROM user_proxies WHERE owner_account_id = ? OR userId = ?",
+          [uId, uId]
+        );
         return {
           id: uId,
           email: u.email,
@@ -955,8 +951,8 @@ app.get("/api/admin/users", authenticateToken, requireAdmin, async (req, res) =>
           isActive: u.isActive,
           twoFactorEnabled: Boolean(u.twoFactorEnabled),
           createdAt: u.createdAt,
-          profilesCount,
-          proxiesCount,
+          profilesCount: profilesCountRow.cnt,
+          proxiesCount: proxiesCountRow.cnt,
         };
       })
     );
@@ -979,43 +975,34 @@ app.post("/api/admin/users", authenticateToken, requireAdmin, async (req, res) =
 
   try {
     const db = getDB();
-    const existing = await db.collection("users").findOne({ email: email.toLowerCase().trim() });
-    if (existing) {
+    const [existing] = await db.query("SELECT id FROM users WHERE email = ?", [email.toLowerCase().trim()]);
+    if (existing.length > 0) {
       return res.status(400).json({ error: "User with this email already exists." });
     }
 
     const salt = await bcrypt.genSalt(10);
     const passwordHash = await bcrypt.hash(password, salt);
 
-    const newUser = {
-      email: email.toLowerCase().trim(),
-      passwordHash,
-      fullName: fullName || email.split("@")[0],
-      role: role || "user",
-      isActive: true,
-      twoFactorEnabled: false,
-      failedAttempts: 0,
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-    };
-
-    const result = await db.collection("users").insertOne(newUser);
-    const createdId = result.insertedId.toString();
+    const [result] = await db.query(
+      "INSERT INTO users (email, passwordHash, fullName, role, isActive, twoFactorEnabled, failedAttempts) VALUES (?, ?, ?, ?, true, false, 0)",
+      [email.toLowerCase().trim(), passwordHash, fullName || email.split("@")[0], role || "user"]
+    );
+    const createdId = result.insertId.toString();
 
     await recordAuditLog(req.user.id, req.user.email, "USER_CREATE", createdId, {
-      email: newUser.email,
-      role: newUser.role,
+      email: email.toLowerCase().trim(),
+      role: role || "user",
     });
 
     res.json({
       success: true,
       user: {
         id: createdId,
-        email: newUser.email,
-        fullName: newUser.fullName,
-        role: newUser.role,
-        isActive: newUser.isActive,
-        createdAt: newUser.createdAt,
+        email: email.toLowerCase().trim(),
+        fullName: fullName || email.split("@")[0],
+        role: role || "user",
+        isActive: true,
+        createdAt: toMySQLDate(),
       },
     });
   } catch (err) {
@@ -1029,29 +1016,37 @@ app.patch("/api/admin/users/:id", authenticateToken, requireAdmin, async (req, r
 
   try {
     const db = getDB();
-    const updateFields = { updatedAt: new Date().toISOString() };
+    const setClauses = ["updatedAt = ?"];
+    const params = [toMySQLDate()];
 
     if (typeof isActive === "boolean") {
-      updateFields.isActive = isActive;
-      // If disabled -> revoke active sessions instantly
+      setClauses.push("isActive = ?");
+      params.push(isActive);
       if (!isActive) {
         await revokeAllUserSessions(id);
       }
     }
-    if (role) updateFields.role = role;
-    if (fullName) updateFields.fullName = fullName;
+    if (role) {
+      setClauses.push("role = ?");
+      params.push(role);
+    }
+    if (fullName) {
+      setClauses.push("fullName = ?");
+      params.push(fullName);
+    }
     if (password) {
       const policyErr = validatePasswordPolicy(password);
       if (policyErr) return res.status(400).json({ error: policyErr });
       const salt = await bcrypt.genSalt(10);
-      updateFields.passwordHash = await bcrypt.hash(password, salt);
-      // Revoke sessions on password reset
+      setClauses.push("passwordHash = ?");
+      params.push(await bcrypt.hash(password, salt));
       await revokeAllUserSessions(id);
     }
 
-    await db.collection("users").updateOne({ _id: new ObjectId(id) }, { $set: updateFields });
+    params.push(parseInt(id));
+    await db.query(`UPDATE users SET ${setClauses.join(", ")} WHERE id = ?`, params);
 
-    await recordAuditLog(req.user.id, req.user.email, "USER_UPDATE", id, updateFields);
+    await recordAuditLog(req.user.id, req.user.email, "USER_UPDATE", id, { isActive, role, fullName, password: password ? "***" : undefined });
 
     res.json({ success: true, message: "User updated successfully." });
   } catch (err) {
@@ -1066,7 +1061,8 @@ app.delete("/api/admin/users/:id", authenticateToken, requireAdmin, async (req, 
 
   try {
     const db = getDB();
-    const adminUser = await db.collection("users").findOne({ _id: new ObjectId(req.user.id) });
+    const [adminUsers] = await db.query("SELECT * FROM users WHERE id = ?", [parseInt(req.user.id)]);
+    const adminUser = adminUsers[0];
 
     if (adminPassword) {
       const passwordValid = await bcrypt.compare(adminPassword, adminUser.passwordHash);
@@ -1075,11 +1071,12 @@ app.delete("/api/admin/users/:id", authenticateToken, requireAdmin, async (req, 
       }
     }
 
-    const user = await db.collection("users").findOne({ _id: new ObjectId(id) });
+    const [users] = await db.query("SELECT * FROM users WHERE id = ?", [parseInt(id)]);
+    const user = users[0];
     if (!user) return res.status(404).json({ error: "User not found." });
 
     await revokeAllUserSessions(id);
-    await db.collection("users").deleteOne({ _id: new ObjectId(id) });
+    await db.query("DELETE FROM users WHERE id = ?", [parseInt(id)]);
 
     await recordAuditLog(req.user.id, req.user.email, "USER_DELETE", id, { email: user.email });
 
@@ -1092,14 +1089,14 @@ app.delete("/api/admin/users/:id", authenticateToken, requireAdmin, async (req, 
 app.get("/api/admin/audit-logs", authenticateToken, requireAdmin, async (req, res) => {
   try {
     const db = getDB();
-    const logs = await db.collection("audit_logs").find().sort({ timestamp: -1 }).limit(200).toArray();
+    const [logs] = await db.query("SELECT * FROM audit_logs ORDER BY timestamp DESC LIMIT 200");
     res.json({ logs });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// ─── Data Endpoints (Profiles, Proxies) ───
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Data Endpoints (Profiles, Proxies, Fingerprints, Bookmarks, Extension Sets) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 
 const ENCRYPTION_KEY = crypto.createHash("sha256").update(JWT_SECRET).digest();
 const ENCRYPTION_IV_LENGTH = 16;
@@ -1135,11 +1132,16 @@ function decryptField(ciphertext) {
   }
 }
 
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Profile Metas Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+
 app.get("/api/data/profiles", authenticateToken, async (req, res) => {
   try {
     const db = getDB();
-    const ownerQuery = { $or: [{ owner_account_id: req.user.id }, { userId: req.user.id }] };
-    const profiles = await db.collection("profile_metas").find(ownerQuery).toArray();
+    const [rows] = await db.query(
+      "SELECT * FROM profile_metas WHERE owner_account_id = ? OR userId = ?",
+      [req.user.id, req.user.id]
+    );
+    const profiles = rows.map(r => ({ id: r.id, ...(typeof r.document === "string" ? JSON.parse(r.document) : r.document) }));
     res.json({ profiles });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1150,14 +1152,15 @@ app.get("/api/data/profiles/:id", authenticateToken, async (req, res) => {
   try {
     const db = getDB();
     const profileId = req.params.id;
-    const ownerQuery = {
-      id: profileId,
-      $or: [{ owner_account_id: req.user.id }, { userId: req.user.id }],
-    };
-    const profile = await db.collection("profile_metas").findOne(ownerQuery);
-    if (!profile) {
+    const [rows] = await db.query(
+      "SELECT * FROM profile_metas WHERE id = ? AND (owner_account_id = ? OR userId = ?)",
+      [profileId, req.user.id, req.user.id]
+    );
+    if (rows.length === 0) {
       return res.status(404).json({ error: "Profile not found or access denied." });
     }
+    const r = rows[0];
+    const profile = { id: r.id, ...(typeof r.document === "string" ? JSON.parse(r.document) : r.document) };
     res.json({ profile });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1167,7 +1170,7 @@ app.get("/api/data/profiles/:id", authenticateToken, async (req, res) => {
 app.post("/api/data/profiles", authenticateToken, async (req, res) => {
   try {
     const db = getDB();
-    const now = new Date().toISOString();
+    const now = toMySQLDate();
     const profile = {
       ...req.body,
       id: req.body.id || `prof-${Date.now()}`,
@@ -1176,27 +1179,23 @@ app.post("/api/data/profiles", authenticateToken, async (req, res) => {
       created_at: req.body.created_at || req.body.createdAt || now,
       updated_at: now,
     };
-    // Anti-poaching check: Ensure ID does not belong to another tenant
-    const existingOther = await db.collection("profile_metas").findOne({
-      id: profile.id,
-      $and: [
-        { owner_account_id: { $exists: true, $ne: req.user.id } },
-        { userId: { $exists: true, $ne: req.user.id } }
-      ]
-    });
-    if (existingOther) {
+    // Anti-poaching check
+    const [existing] = await db.query(
+      "SELECT id FROM profile_metas WHERE id = ? AND owner_account_id IS NOT NULL AND owner_account_id != ?",
+      [profile.id, req.user.id]
+    );
+    if (existing.length > 0) {
       return res.status(403).json({ error: "Profile ID belongs to another user account." });
     }
-    await db.collection("profile_metas").updateOne(
-      { id: profile.id, $or: [{ owner_account_id: req.user.id }, { userId: req.user.id }] },
-      { $set: profile },
-      { upsert: true }
+    // Upsert into profile_metas
+    await db.query(
+      "INSERT INTO profile_metas (id, owner_account_id, userId, document) VALUES (?, ?, ?, ?) ON DUPLICATE KEY UPDATE document = VALUES(document)",
+      [profile.id, req.user.id, req.user.id, JSON.stringify(profile)]
     );
-    // Mirror to profiles collection
-    await db.collection("profiles").updateOne(
-      { id: profile.id, $or: [{ owner_account_id: req.user.id }, { userId: req.user.id }] },
-      { $set: profile },
-      { upsert: true }
+    // Mirror to profiles
+    await db.query(
+      "INSERT INTO profiles (id, owner_account_id, userId, document) VALUES (?, ?, ?, ?) ON DUPLICATE KEY UPDATE document = VALUES(document)",
+      [profile.id, req.user.id, req.user.id, JSON.stringify(profile)]
     );
     res.json({ success: true, profile });
   } catch (err) {
@@ -1208,21 +1207,16 @@ app.delete("/api/data/profiles/:id", authenticateToken, async (req, res) => {
   try {
     const db = getDB();
     const profileId = req.params.id;
-    const ownerQuery = {
-      $and: [
-        {
-          $or: [
-            { id: profileId },
-            { "_meta.id": profileId },
-            { "config.id": profileId }
-          ]
-        },
-        { $or: [{ owner_account_id: req.user.id }, { userId: req.user.id }] }
-      ]
-    };
-    const resMeta = await db.collection("profile_metas").deleteMany(ownerQuery);
-    const resProf = await db.collection("profiles").deleteMany(ownerQuery);
-    const totalDeleted = resMeta.deletedCount + resProf.deletedCount;
+    // Delete matching profile from both tables (match id or nested _meta.id or config.id)
+    const [resMeta] = await db.query(
+      "DELETE FROM profile_metas WHERE (id = ? OR JSON_UNQUOTE(JSON_EXTRACT(document, '$._meta.id')) = ? OR JSON_UNQUOTE(JSON_EXTRACT(document, '$.config.id')) = ?) AND (owner_account_id = ? OR userId = ?)",
+      [profileId, profileId, profileId, req.user.id, req.user.id]
+    );
+    const [resProf] = await db.query(
+      "DELETE FROM profiles WHERE (id = ? OR JSON_UNQUOTE(JSON_EXTRACT(document, '$._meta.id')) = ? OR JSON_UNQUOTE(JSON_EXTRACT(document, '$.config.id')) = ?) AND (owner_account_id = ? OR userId = ?)",
+      [profileId, profileId, profileId, req.user.id, req.user.id]
+    );
+    const totalDeleted = resMeta.affectedRows + resProf.affectedRows;
     if (totalDeleted === 0) {
       return res.status(404).json({ error: "Profile not found or access denied." });
     }
@@ -1233,16 +1227,20 @@ app.delete("/api/data/profiles/:id", authenticateToken, async (req, res) => {
   }
 });
 
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Proxies Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+
 app.get("/api/data/proxies", authenticateToken, async (req, res) => {
   try {
     const db = getDB();
-    const ownerQuery = { $or: [{ owner_account_id: req.user.id }, { userId: req.user.id }] };
-    const proxies = await db.collection("user_proxies").find(ownerQuery).toArray();
-    const decrypted = proxies.map((p) => ({
-      ...p,
-      password: p.password ? decryptField(p.password) : p.password,
-    }));
-    res.json({ proxies: decrypted });
+    const [rows] = await db.query(
+      "SELECT * FROM user_proxies WHERE owner_account_id = ? OR userId = ?",
+      [req.user.id, req.user.id]
+    );
+    const proxies = rows.map(r => {
+      const doc = typeof r.document === "string" ? JSON.parse(r.document) : r.document;
+      return { id: r.id, ...doc, password: doc.password ? decryptField(doc.password) : doc.password };
+    });
+    res.json({ proxies });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -1252,19 +1250,17 @@ app.get("/api/data/proxies/:id", authenticateToken, async (req, res) => {
   try {
     const db = getDB();
     const proxyId = req.params.id;
-    const ownerQuery = {
-      id: proxyId,
-      $or: [{ owner_account_id: req.user.id }, { userId: req.user.id }],
-    };
-    const proxy = await db.collection("user_proxies").findOne(ownerQuery);
-    if (!proxy) {
+    const [rows] = await db.query(
+      "SELECT * FROM user_proxies WHERE id = ? AND (owner_account_id = ? OR userId = ?)",
+      [proxyId, req.user.id, req.user.id]
+    );
+    if (rows.length === 0) {
       return res.status(404).json({ error: "Proxy not found or access denied." });
     }
-    const decrypted = {
-      ...proxy,
-      password: proxy.password ? decryptField(proxy.password) : proxy.password,
-    };
-    res.json({ proxy: decrypted });
+    const r = rows[0];
+    const doc = typeof r.document === "string" ? JSON.parse(r.document) : r.document;
+    const proxy = { id: r.id, ...doc, password: doc.password ? decryptField(doc.password) : doc.password };
+    res.json({ proxy });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -1275,7 +1271,7 @@ app.post("/api/data/proxies", authenticateToken, async (req, res) => {
     const db = getDB();
     const rawProxy = { ...req.body };
     const encryptedPassword = rawProxy.password ? encryptField(rawProxy.password) : rawProxy.password;
-    const now = new Date().toISOString();
+    const now = toMySQLDate();
     const proxy = {
       ...rawProxy,
       id: rawProxy.id || `proxy-${Date.now()}`,
@@ -1285,20 +1281,23 @@ app.post("/api/data/proxies", authenticateToken, async (req, res) => {
       created_at: rawProxy.created_at || rawProxy.createdAt || now,
       updated_at: now,
     };
-    // Anti-poaching check: Ensure proxy ID does not belong to another tenant
-    const existingOther = await db.collection("user_proxies").findOne({
-      id: proxy.id,
-      $and: [
-        { owner_account_id: { $exists: true, $ne: req.user.id } },
-        { userId: { $exists: true, $ne: req.user.id } }
-      ]
-    });
-    if (existingOther) {
+    // Anti-poaching check
+    const [existing] = await db.query(
+      "SELECT id FROM user_proxies WHERE id = ? AND owner_account_id IS NOT NULL AND owner_account_id != ?",
+      [proxy.id, req.user.id]
+    );
+    if (existing.length > 0) {
       return res.status(403).json({ error: "Proxy ID belongs to another user account." });
     }
-    const ownerQuery = { id: proxy.id, $or: [{ owner_account_id: req.user.id }, { userId: req.user.id }] };
-    await db.collection("user_proxies").updateOne(ownerQuery, { $set: proxy }, { upsert: true });
-    await db.collection("proxies").updateOne(ownerQuery, { $set: proxy }, { upsert: true });
+    // Upsert
+    await db.query(
+      "INSERT INTO user_proxies (id, owner_account_id, userId, document) VALUES (?, ?, ?, ?) ON DUPLICATE KEY UPDATE document = VALUES(document)",
+      [proxy.id, req.user.id, req.user.id, JSON.stringify(proxy)]
+    );
+    await db.query(
+      "INSERT INTO proxies (id, owner_account_id, userId, document) VALUES (?, ?, ?, ?) ON DUPLICATE KEY UPDATE document = VALUES(document)",
+      [proxy.id, req.user.id, req.user.id, JSON.stringify(proxy)]
+    );
     res.json({ success: true, proxy: { ...proxy, password: rawProxy.password } });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1309,29 +1308,34 @@ app.delete("/api/data/proxies/:id", authenticateToken, async (req, res) => {
   try {
     const db = getDB();
     const proxyId = req.params.id;
-    const ownerQuery = {
-      id: proxyId,
-      $or: [{ owner_account_id: req.user.id }, { userId: req.user.id }],
-    };
-    const result = await db.collection("user_proxies").deleteOne(ownerQuery);
-    await db.collection("proxies").deleteOne(ownerQuery);
-    if (result.deletedCount === 0) {
+    const [result] = await db.query(
+      "DELETE FROM user_proxies WHERE id = ? AND (owner_account_id = ? OR userId = ?)",
+      [proxyId, req.user.id, req.user.id]
+    );
+    await db.query(
+      "DELETE FROM proxies WHERE id = ? AND (owner_account_id = ? OR userId = ?)",
+      [proxyId, req.user.id, req.user.id]
+    );
+    if (result.affectedRows === 0) {
       return res.status(404).json({ error: "Proxy not found or access denied." });
     }
     await recordAuditLog(req.user.id, req.user.email, "proxy_deleted", proxyId, { proxyId });
-    res.json({ success: true, deletedCount: result.deletedCount });
+    res.json({ success: true, deletedCount: result.affectedRows });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// ─── Fingerprints, Bookmarks, and Folders (Account-Scoped) ───
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Fingerprints, Bookmarks, and Folders (Account-Scoped) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 
 app.get("/api/data/fingerprints", authenticateToken, async (req, res) => {
   try {
     const db = getDB();
-    const ownerQuery = { $or: [{ owner_account_id: req.user.id }, { userId: req.user.id }] };
-    const fingerprints = await db.collection("fingerprints").find(ownerQuery).toArray();
+    const [rows] = await db.query(
+      "SELECT * FROM fingerprints WHERE owner_account_id = ? OR userId = ?",
+      [req.user.id, req.user.id]
+    );
+    const fingerprints = rows.map(r => ({ id: r.id, ...(typeof r.document === "string" ? JSON.parse(r.document) : r.document) }));
     res.json({ fingerprints });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1341,16 +1345,15 @@ app.get("/api/data/fingerprints", authenticateToken, async (req, res) => {
 app.get("/api/data/fingerprints/:id", authenticateToken, async (req, res) => {
   try {
     const db = getDB();
-    const id = req.params.id;
-    const ownerQuery = {
-      id,
-      $or: [{ owner_account_id: req.user.id }, { userId: req.user.id }],
-    };
-    const fp = await db.collection("fingerprints").findOne(ownerQuery);
-    if (!fp) {
+    const [rows] = await db.query(
+      "SELECT * FROM fingerprints WHERE id = ? AND (owner_account_id = ? OR userId = ?)",
+      [req.params.id, req.user.id, req.user.id]
+    );
+    if (rows.length === 0) {
       return res.status(404).json({ error: "Fingerprint not found or access denied." });
     }
-    res.json({ fingerprint: fp });
+    const r = rows[0];
+    res.json({ fingerprint: { id: r.id, ...(typeof r.document === "string" ? JSON.parse(r.document) : r.document) } });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -1359,7 +1362,7 @@ app.get("/api/data/fingerprints/:id", authenticateToken, async (req, res) => {
 app.post("/api/data/fingerprints", authenticateToken, async (req, res) => {
   try {
     const db = getDB();
-    const now = new Date().toISOString();
+    const now = toMySQLDate();
     const fp = {
       ...req.body,
       id: req.body.id || `fp-${Date.now()}`,
@@ -1368,30 +1371,34 @@ app.post("/api/data/fingerprints", authenticateToken, async (req, res) => {
       created_at: req.body.created_at || now,
       updated_at: now,
     };
-    // Anti-poaching check: Ensure fingerprint ID does not belong to another tenant
-    const existingOther = await db.collection("fingerprints").findOne({
-      id: fp.id,
-      $and: [
-        { owner_account_id: { $exists: true, $ne: req.user.id } },
-        { userId: { $exists: true, $ne: req.user.id } }
-      ]
-    });
-    if (existingOther) {
+    // Anti-poaching check
+    const [existing] = await db.query(
+      "SELECT id FROM fingerprints WHERE id = ? AND owner_account_id IS NOT NULL AND owner_account_id != ?",
+      [fp.id, req.user.id]
+    );
+    if (existing.length > 0) {
       return res.status(403).json({ error: "Fingerprint ID belongs to another user account." });
     }
-    const ownerQuery = { id: fp.id, $or: [{ owner_account_id: req.user.id }, { userId: req.user.id }] };
-    await db.collection("fingerprints").updateOne(ownerQuery, { $set: fp }, { upsert: true });
+    await db.query(
+      "INSERT INTO fingerprints (id, owner_account_id, userId, document) VALUES (?, ?, ?, ?) ON DUPLICATE KEY UPDATE document = VALUES(document)",
+      [fp.id, req.user.id, req.user.id, JSON.stringify(fp)]
+    );
     res.json({ success: true, fingerprint: fp });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Bookmarks Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+
 app.get("/api/data/bookmarks", authenticateToken, async (req, res) => {
   try {
     const db = getDB();
-    const ownerQuery = { $or: [{ owner_account_id: req.user.id }, { userId: req.user.id }] };
-    const bookmarks = await db.collection("bookmarks").find(ownerQuery).toArray();
+    const [rows] = await db.query(
+      "SELECT * FROM bookmarks WHERE owner_account_id = ? OR userId = ?",
+      [req.user.id, req.user.id]
+    );
+    const bookmarks = rows.map(r => ({ id: r.id, ...(typeof r.document === "string" ? JSON.parse(r.document) : r.document) }));
     res.json({ bookmarks });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1401,7 +1408,7 @@ app.get("/api/data/bookmarks", authenticateToken, async (req, res) => {
 app.post("/api/data/bookmarks", authenticateToken, async (req, res) => {
   try {
     const db = getDB();
-    const now = new Date().toISOString();
+    const now = toMySQLDate();
     const bm = {
       ...req.body,
       id: req.body.id || `bm-${Date.now()}`,
@@ -1410,19 +1417,18 @@ app.post("/api/data/bookmarks", authenticateToken, async (req, res) => {
       created_at: req.body.created_at || now,
       updated_at: now,
     };
-    // Anti-poaching check: Ensure bookmark ID does not belong to another tenant
-    const existingOther = await db.collection("bookmarks").findOne({
-      id: bm.id,
-      $and: [
-        { owner_account_id: { $exists: true, $ne: req.user.id } },
-        { userId: { $exists: true, $ne: req.user.id } }
-      ]
-    });
-    if (existingOther) {
+    // Anti-poaching check
+    const [existing] = await db.query(
+      "SELECT id FROM bookmarks WHERE id = ? AND owner_account_id IS NOT NULL AND owner_account_id != ?",
+      [bm.id, req.user.id]
+    );
+    if (existing.length > 0) {
       return res.status(403).json({ error: "Bookmark ID belongs to another user account." });
     }
-    const ownerQuery = { id: bm.id, $or: [{ owner_account_id: req.user.id }, { userId: req.user.id }] };
-    await db.collection("bookmarks").updateOne(ownerQuery, { $set: bm }, { upsert: true });
+    await db.query(
+      "INSERT INTO bookmarks (id, owner_account_id, userId, document) VALUES (?, ?, ?, ?) ON DUPLICATE KEY UPDATE document = VALUES(document)",
+      [bm.id, req.user.id, req.user.id, JSON.stringify(bm)]
+    );
     res.json({ success: true, bookmark: bm });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1432,25 +1438,26 @@ app.post("/api/data/bookmarks", authenticateToken, async (req, res) => {
 app.delete("/api/data/bookmarks/:id", authenticateToken, async (req, res) => {
   try {
     const db = getDB();
-    const id = req.params.id;
-    const ownerQuery = {
-      id,
-      $or: [{ owner_account_id: req.user.id }, { userId: req.user.id }],
-    };
-    const result = await db.collection("bookmarks").deleteOne(ownerQuery);
-    res.json({ success: true, deletedCount: result.deletedCount });
+    const [result] = await db.query(
+      "DELETE FROM bookmarks WHERE id = ? AND (owner_account_id = ? OR userId = ?)",
+      [req.params.id, req.user.id, req.user.id]
+    );
+    res.json({ success: true, deletedCount: result.affectedRows });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// ─── Extension Sets (Account-Scoped) ───
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Extension Sets (Account-Scoped) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 
 app.get("/api/data/extension-sets", authenticateToken, async (req, res) => {
   try {
     const db = getDB();
-    const ownerQuery = { $or: [{ owner_account_id: req.user.id }, { userId: req.user.id }] };
-    const sets = await db.collection("extension_sets").find(ownerQuery).toArray();
+    const [rows] = await db.query(
+      "SELECT * FROM extension_sets WHERE owner_account_id = ? OR userId = ?",
+      [req.user.id, req.user.id]
+    );
+    const sets = rows.map(r => ({ id: r.id, ...(typeof r.document === "string" ? JSON.parse(r.document) : r.document) }));
     res.json(sets);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1460,7 +1467,7 @@ app.get("/api/data/extension-sets", authenticateToken, async (req, res) => {
 app.post("/api/data/extension-sets", authenticateToken, async (req, res) => {
   try {
     const db = getDB();
-    const now = new Date().toISOString();
+    const now = toMySQLDate();
     const setDoc = {
       ...req.body,
       id: req.body.id || `set-${Date.now()}`,
@@ -1472,19 +1479,18 @@ app.post("/api/data/extension-sets", authenticateToken, async (req, res) => {
       created_at: req.body.created_at || now,
       updated_at: now,
     };
-    // Anti-poaching check: Ensure ID does not belong to another tenant
-    const existingOther = await db.collection("extension_sets").findOne({
-      id: setDoc.id,
-      $and: [
-        { owner_account_id: { $exists: true, $ne: req.user.id } },
-        { userId: { $exists: true, $ne: req.user.id } }
-      ]
-    });
-    if (existingOther) {
+    // Anti-poaching check
+    const [existing] = await db.query(
+      "SELECT id FROM extension_sets WHERE id = ? AND owner_account_id IS NOT NULL AND owner_account_id != ?",
+      [setDoc.id, req.user.id]
+    );
+    if (existing.length > 0) {
       return res.status(403).json({ error: "Extension Set ID belongs to another user account." });
     }
-    const ownerQuery = { id: setDoc.id, $or: [{ owner_account_id: req.user.id }, { userId: req.user.id }] };
-    await db.collection("extension_sets").updateOne(ownerQuery, { $set: setDoc }, { upsert: true });
+    await db.query(
+      "INSERT INTO extension_sets (id, owner_account_id, userId, document) VALUES (?, ?, ?, ?) ON DUPLICATE KEY UPDATE document = VALUES(document)",
+      [setDoc.id, req.user.id, req.user.id, JSON.stringify(setDoc)]
+    );
     res.json({ success: true, set: setDoc });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1494,83 +1500,77 @@ app.post("/api/data/extension-sets", authenticateToken, async (req, res) => {
 app.delete("/api/data/extension-sets/:id", authenticateToken, async (req, res) => {
   try {
     const db = getDB();
-    const id = req.params.id;
-    const ownerQuery = {
-      id,
-      $or: [{ owner_account_id: req.user.id }, { userId: req.user.id }],
-    };
-    const result = await db.collection("extension_sets").deleteOne(ownerQuery);
-    if (result.deletedCount === 0) {
+    const [result] = await db.query(
+      "DELETE FROM extension_sets WHERE id = ? AND (owner_account_id = ? OR userId = ?)",
+      [req.params.id, req.user.id, req.user.id]
+    );
+    if (result.affectedRows === 0) {
       return res.status(404).json({ error: "Extension Set not found or access denied." });
     }
-    res.json({ success: true, deletedCount: result.deletedCount });
+    res.json({ success: true, deletedCount: result.affectedRows });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// ─── Initial Database Seed Function ───
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Initial Database Seed Function Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 async function seedInitialUsers() {
   const db = getDB();
-  const usersCol = db.collection("users");
 
-  const adminEmail = "admin@opinioninsights.com";
-  const testEmail = "test@opinioninsights.local";
-
-  const adminExists = await usersCol.findOne({ email: adminEmail });
-  if (!adminExists) {
+  // Seed admin with requested credentials
+  const adminEmail = "admin@opinioninsights.in";
+  const [adminRows] = await db.query("SELECT id FROM users WHERE email = ?", [adminEmail]);
+  if (adminRows.length === 0) {
     const salt = await bcrypt.genSalt(10);
-    const passwordHash = await bcrypt.hash("AdminPassword123!", salt);
-    await usersCol.insertOne({
-      email: adminEmail,
-      passwordHash,
-      fullName: "Opinion Admin",
-      role: "admin",
-      isActive: true,
-      twoFactorEnabled: false,
-      failedAttempts: 0,
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-    });
-    console.log(`[Seed] Initial Admin user created: ${adminEmail}`);
+    const passwordHash = await bcrypt.hash("Delle6400@", salt);
+    await db.query(
+      "INSERT INTO users (email, passwordHash, fullName, role, isActive, twoFactorEnabled, failedAttempts) VALUES (?, ?, ?, ?, true, false, 0)",
+      [adminEmail, passwordHash, "Admin", "admin"]
+    );
+    console.log(`[Seed] Admin user created: ${adminEmail}`);
   }
 
-  const testExists = await usersCol.findOne({ email: testEmail });
-  if (!testExists) {
+  // Seed vendor default user
+  const vendorEmail = "vendor@opinioninsights.in";
+  const [vendorRows] = await db.query("SELECT id FROM users WHERE email = ?", [vendorEmail]);
+  if (vendorRows.length === 0) {
     const salt = await bcrypt.genSalt(10);
-    const passwordHash = await bcrypt.hash("Test@12345678!", salt);
-    await usersCol.insertOne({
-      email: testEmail,
-      passwordHash,
-      fullName: "Test Insights User",
-      role: "user",
-      isActive: true,
-      twoFactorEnabled: false,
-      failedAttempts: 0,
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-    });
-    console.log(`[Seed] Initial Test user created: ${testEmail}`);
+    const passwordHash = await bcrypt.hash("Delle6400@", salt);
+    await db.query(
+      "INSERT INTO users (email, passwordHash, fullName, role, isActive, twoFactorEnabled, failedAttempts) VALUES (?, ?, ?, ?, true, false, 0)",
+      [vendorEmail, passwordHash, "Default Vendor", "vendor"]
+    );
+    console.log(`[Seed] Vendor user created: ${vendorEmail}`);
   }
 }
 
 let serverInstance = null;
 
-// ─── Start Server ───
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Start Server Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 async function start() {
-  try {
-    await connectDB();
-    await seedInitialUsers();
-    if (!process.env.VERCEL) {
-      serverInstance = app.listen(PORT, () => {
-        console.log(`[Opinion Insights Backend API] Running on http://localhost:${PORT}`);
-      });
+  const MAX_RETRIES = 3;
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      await connectDB();
+      await seedInitialUsers();
+      if (!process.env.VERCEL) {
+        serverInstance = app.listen(PORT, () => {
+          console.log(`[Opinion Insights Backend API] Running on http://localhost:${PORT}`);
+        });
+      }
+      return;
+    } catch (err) {
+      console.error(`[Backend] Startup attempt ${attempt}/${MAX_RETRIES} failed:`, err.message);
+      if (attempt < MAX_RETRIES) {
+        const delayMs = 3000 * attempt;
+        console.log(`[Backend] Retrying in ${delayMs / 1000}s...`);
+        await new Promise(r => setTimeout(r, delayMs));
+      }
     }
-  } catch (err) {
-    console.error("[Backend] Failed to start:", err);
-    if (!process.env.VERCEL) {
-      process.exit(1);
-    }
+  }
+  console.error("[Backend] All startup retries exhausted. Cannot reach MySQL. Exiting.");
+  if (!process.env.VERCEL) {
+    process.exit(1);
   }
 }
 
