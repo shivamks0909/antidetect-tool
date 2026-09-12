@@ -16,11 +16,11 @@ if (process.env.VERCEL) {
 
 // ─── MySQL Pool Config ───
 const poolConfig = {
-  host: process.env.MYSQL_HOST,
-  port: parseInt(process.env.MYSQL_PORT || "3306"),
-  user: process.env.MYSQL_USER,
-  password: process.env.MYSQL_PASSWORD,
-  database: process.env.MYSQL_DATABASE,
+  host: (process.env.MYSQL_HOST || "").trim(),
+  port: parseInt((process.env.MYSQL_PORT || "3306").trim()),
+  user: (process.env.MYSQL_USER || "").trim(),
+  password: (process.env.MYSQL_PASSWORD || "").trim(),
+  database: (process.env.MYSQL_DATABASE || "").trim(),
   waitForConnections: true,
   connectionLimit: 10,
   queueLimit: 0,
@@ -185,9 +185,6 @@ CREATE TABLE IF NOT EXISTS quarantined_records (
   reason TEXT
 );
 
--- Fix tables that may have been created with wrong column names
-DROP TABLE IF EXISTS audit_logs;
-DROP TABLE IF EXISTS email_verifications;
 `;
 
 // ─── Connection Pool ───
