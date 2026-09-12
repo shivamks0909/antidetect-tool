@@ -180,23 +180,8 @@ const forgotPasswordLimiter = rateLimit({
 
 // Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Password Policy Validator Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 export function validatePasswordPolicy(password, userEmail = "", fullName = "") {
-  if (password.length < 12) {
-    return "Password must be at least 12 characters long.";
-  }
-  if (!/[A-Z]/.test(password)) {
-    return "Password must contain at least one uppercase letter (A-Z).";
-  }
-  if (!/[a-z]/.test(password)) {
-    return "Password must contain at least one lowercase letter (a-z).";
-  }
-  if (!/[0-9]/.test(password)) {
-    return "Password must contain at least one number (0-9).";
-  }
-  if (!/[!@#$%^&*()_+\-=\[\]{};':"\\|,.<>\/?]/.test(password)) {
-    return "Password must contain at least one special character.";
-  }
-  if (userEmail && password.toLowerCase().includes(userEmail.split("@")[0].toLowerCase())) {
-    return "Password cannot contain your email or username.";
+  if (!password || password.length < 1) {
+    return "Password is required.";
   }
   return null;
 }
