@@ -184,6 +184,10 @@ CREATE TABLE IF NOT EXISTS quarantined_records (
   quarantinedAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
   reason TEXT
 );
+
+-- Fix tables that may have been created with wrong column names
+DROP TABLE IF EXISTS audit_logs;
+DROP TABLE IF EXISTS email_verifications;
 `;
 
 // ─── Connection Pool ───
