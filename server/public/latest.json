@@ -1,10 +1,10 @@
 {
   "version": "2.3.0",
-  "notes": "Opinion Insights Browser v2.3.0 — Permanent authentication session persistence, geolocation:// proxy support, and reliability improvements.",
+  "notes": "Opinion Insights Browser v2.3.0 — Permanent authentication session persistence, geolocation:// proxy support, bundled fingerprint library, and reliability improvements.",
   "pub_date": "2026-09-14T00:00:00Z",
   "platforms": {
     "windows-x86_64": {
-      "signature": "AAAPQwHTSKzl/Wn9ngBYxYsp6I2dOq+zx0pAEkDCFgVTdEHA4CRDjOW92IyugZ8PY2ke/g+LeVMmc15w9hRZlEz30zTLpX0cwpk9DQ==",
+      "signature": "AAAPQwHTSKzl/Wn93J6KvQ5EUmamYHz8fxiAOKl7mRsSMvaM/JDpt9tF0ngz1Rn60fXid13NzUWHJDvpTm9z6HzKr3ZbLEL8nWRxDQ==",
       "url": "https://github.com/shivamks0909/antidetect-tool/releases/download/v2.3.0/Opinion.Insights.Browser_2.3.0_x64-setup.nsis.zip"
     }
   }

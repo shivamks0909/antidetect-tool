@@ -112,8 +112,8 @@ fn engine_root_dir() -> &'static str {
 }
 
 // Bundled fingerprint library (cross-platform); seeds fingerprints dir on first run.
-const FINGERPRINTS_ARCHIVE_KEY: &str = "Opinion-Insights-Fingerprints.zip";
-const FINGERPRINTS_TOP_DIR: &str = "opinion-insights-fingerprints";
+const FINGERPRINTS_ARCHIVE_KEY: &str = "ShardX-Fingerprints.zip";
+const FINGERPRINTS_TOP_DIR: &str = "shardx-fingerprints";
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 struct Manifest {
