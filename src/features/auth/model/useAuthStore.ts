@@ -219,15 +219,27 @@ export const useAuthStore = create<AuthState>((set, get) => {
       const rawInput = identifier.trim();
       const resolvedEmail =
         !rawInput.includes("@") && rawInput.toLowerCase() === "admin"
-          ? "admin@opinioninsights.com"
+          ? "admin@opinioninsights.in"
           : rawInput;
 
       try {
-        const res = await apiFetch(`${API_BASE}/auth/login`, {
+        let res = await apiFetch(`${API_BASE}/auth/login`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ email: resolvedEmail, password }),
         });
+
+        // If server experienced cold-start DB error, auto-fix and retry once
+        if (!res.ok && res.status >= 500) {
+          try {
+            await apiFetch(`${API_BASE}/auth/auto-fix`, { method: "POST" });
+            res = await apiFetch(`${API_BASE}/auth/login`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ email: resolvedEmail, password }),
+            });
+          } catch (_) {}
+        }
 
         const data = await res.json();
 

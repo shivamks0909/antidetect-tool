@@ -83,6 +83,12 @@ export const api = {
     return data;
   },
 
+  autoFix: async () => {
+    return request<{ success: boolean; message: string; report?: any }>("/auth/auto-fix", {
+      method: "POST",
+    });
+  },
+
   login2FA: async (tempToken: string, code: string) => {
     const data = await request<{
       success: boolean;

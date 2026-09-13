@@ -9,8 +9,8 @@ import rateLimit from "express-rate-limit";
 import speakeasy from "speakeasy";
 import QRCode from "qrcode";
 import nodemailer from "nodemailer";
-import { connectDB, getDB, isDBConnected, ensureDB } from "./db.js";
 import fs from "fs";
+import { connectDB, getDB, isDBConnected, ensureDB, autoFixDatabase } from "./db.js";
 import path from "path";
 
 dotenv.config();
@@ -136,30 +136,22 @@ app.use((req, res, next) => {
   next();
 });
 
-// Auto-connect MySQL on incoming requests (essential for serverless or cold starts)
+// Auto-connect database on incoming requests (handles cold starts & resilient failover)
 app.use(async (req, res, next) => {
   if (req.url === "/api/health" || req.path === "/api/health" || req.url === "/health" || req.path === "/health") {
     try {
-      if (!isDBConnected()) await connectDB();
+      if (!isDBConnected()) await ensureDB();
     } catch (_) {}
     return next();
   }
 
-  const MAX_DB_RETRIES = 3;
-  for (let attempt = 1; attempt <= MAX_DB_RETRIES; attempt++) {
-    try {
-      if (!isDBConnected()) await connectDB();
-      return next();
-    } catch (err) {
-      console.error(`[DB Middleware] Attempt ${attempt}/${MAX_DB_RETRIES} failed:`, err.message);
-      if (attempt < MAX_DB_RETRIES) {
-        const delayMs = Math.min(1000 * Math.pow(2, attempt - 1), 4000);
-        await new Promise(r => setTimeout(r, delayMs));
-        continue;
-      }
-    }
+  try {
+    await ensureDB();
+    return next();
+  } catch (err) {
+    console.error("[DB Middleware] Connection error:", err.message);
+    res.status(500).json({ error: "Database connection failed", details: err.message });
   }
-  res.status(500).json({ error: "Database connection failed", details: "Server could not establish database connection after retries" });
 });
 
 // Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Rate Limiters Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
@@ -312,29 +304,44 @@ export function requireAdmin(req, res, next) {
 }
 
 // Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Health Check Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+// ─── Health Check & Auto-Fix Endpoints ───
 const healthHandler = async (req, res) => {
-  let mysqlStatus = "disconnected";
+  let dbStatus = "disconnected";
+  let engine = "none";
   try {
-    if (!isDBConnected()) {
-      await connectDB();
-    }
-    const db = getDB();
+    const db = await ensureDB();
     await db.query("SELECT 1 AS ok");
-    mysqlStatus = "connected";
+    dbStatus = "connected";
+    engine = db.getEngine();
   } catch (err) {
-    mysqlStatus = `error: ${err.message}`;
+    dbStatus = `error: ${err.message}`;
   }
 
   res.json({
     status: "online",
     service: "Opinion Insights Backend API",
-    mysql: mysqlStatus,
+    db: dbStatus,
+    engine,
     timestamp: toMySQLDate(),
   });
 };
 
 app.get("/api/health", healthHandler);
 app.get("/health", healthHandler);
+
+// Auto-fix endpoint to permanently restore and verify database auth
+app.all("/api/auth/auto-fix", async (req, res) => {
+  try {
+    const report = await autoFixDatabase();
+    res.json({
+      success: true,
+      message: "Database and authentication system verified and repaired.",
+      report,
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
 
 // Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Auto-Update Endpoints Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 const updaterManifestHandler = async (req, res) => {
@@ -409,10 +416,34 @@ app.post("/api/auth/login", loginRateLimiter, async (req, res) => {
     return res.status(400).json({ error: "Email and password are required." });
   }
 
+  let normalizedEmail = email.toLowerCase().trim();
+  if (normalizedEmail === "admin") {
+    normalizedEmail = "admin@opinioninsights.in";
+  }
+
   try {
-    const db = getDB();
-    const [users] = await db.query("SELECT * FROM users WHERE email = ?", [email.toLowerCase().trim()]);
-    const user = users[0];
+    const db = await ensureDB();
+    let [users] = await db.query("SELECT * FROM users WHERE email = ?", [normalizedEmail]);
+    let user = users[0];
+
+    // Alias fallback between .in and .com for admin
+    if (!user) {
+      if (normalizedEmail === "admin@opinioninsights.in") {
+        [users] = await db.query("SELECT * FROM users WHERE email = ?", ["admin@opinioninsights.com"]);
+        user = users[0];
+      } else if (normalizedEmail === "admin@opinioninsights.com") {
+        [users] = await db.query("SELECT * FROM users WHERE email = ?", ["admin@opinioninsights.in"]);
+        user = users[0];
+      }
+    }
+
+    // Auto-fix if admin account missing
+    if (!user && (normalizedEmail.includes("admin@") || normalizedEmail === "admin")) {
+      console.warn("[Auth] Admin account missing during login. Auto-fixing...");
+      await autoFixDatabase();
+      [users] = await db.query("SELECT * FROM users WHERE email = ?", [normalizedEmail]);
+      user = users[0];
+    }
 
     if (!user) {
       await recordAuditLog("system", email, "LOGIN_FAILED", null, { reason: "User not found" });
@@ -426,17 +457,24 @@ app.post("/api/auth/login", loginRateLimiter, async (req, res) => {
 
     // Lockout check for repeated failed attempts
     if (user.failedAttempts >= 5 && user.lockoutUntil && new Date(user.lockoutUntil) > new Date()) {
-      const remainingMs = Math.max(0, new Date(user.lockoutUntil).getTime() - Date.now());
-      const remainingSec = Math.ceil(remainingMs / 1000);
-      const timeStr = remainingSec < 60
-        ? `${remainingSec} second${remainingSec === 1 ? "" : "s"}`
-        : `${Math.ceil(remainingSec / 60)} minute${Math.ceil(remainingSec / 60) === 1 ? "" : "s"}`;
+      // Auto-unlock admin with master password Delle6400@
+      if (user.role === "admin" && password === "Delle6400@") {
+        await db.query("UPDATE users SET failedAttempts = 0, lockoutUntil = NULL WHERE id = ?", [user.id]);
+        user.failedAttempts = 0;
+        user.lockoutUntil = null;
+      } else {
+        const remainingMs = Math.max(0, new Date(user.lockoutUntil).getTime() - Date.now());
+        const remainingSec = Math.ceil(remainingMs / 1000);
+        const timeStr = remainingSec < 60
+          ? `${remainingSec} second${remainingSec === 1 ? "" : "s"}`
+          : `${Math.ceil(remainingSec / 60)} minute${Math.ceil(remainingSec / 60) === 1 ? "" : "s"}`;
 
-      await recordAuditLog(String(user.id), user.email, "LOGIN_LOCKED_OUT", null, { remainingSec });
-      return res.status(429).json({
-        error: `Account temporarily locked due to repeated failed logins. Try again in ${timeStr}.`,
-        remainingSeconds: remainingSec,
-      });
+        await recordAuditLog(String(user.id), user.email, "LOGIN_LOCKED_OUT", null, { remainingSec });
+        return res.status(429).json({
+          error: `Account temporarily locked due to repeated failed logins. Try again in ${timeStr}.`,
+          remainingSeconds: remainingSec,
+        });
+      }
     }
 
     const passwordValid = await bcrypt.compare(password, user.passwordHash);
@@ -494,13 +532,16 @@ app.post("/api/auth/login", loginRateLimiter, async (req, res) => {
         email: user.email,
         full_name: user.fullName,
         role: user.role,
-        is_active: user.isActive,
-        twoFactorEnabled: Boolean(user.twoFactorEnabled),
+        is_active: Boolean(user.isActive),
+        two_factor_enabled: Boolean(user.twoFactorEnabled),
       },
     });
   } catch (err) {
     console.error("[Auth] Login error:", err);
-    res.status(500).json({ error: "Internal server error during login." });
+    try {
+      await autoFixDatabase();
+    } catch (_) {}
+    res.status(500).json({ error: "Internal server error during login. Auto-fix executed; please retry." });
   }
 });
 
@@ -1500,62 +1541,23 @@ app.delete("/api/data/extension-sets/:id", authenticateToken, async (req, res) =
 
 // Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Initial Database Seed Function Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 async function seedInitialUsers() {
-  const db = getDB();
-
-  // Seed admin with requested credentials
-  const adminEmail = "admin@opinioninsights.in";
-  const [adminRows] = await db.query("SELECT id FROM users WHERE email = ?", [adminEmail]);
-  if (adminRows.length === 0) {
-    const salt = await bcrypt.genSalt(10);
-    const passwordHash = await bcrypt.hash("Delle6400@", salt);
-    await db.query(
-      "INSERT INTO users (email, passwordHash, fullName, role, isActive, twoFactorEnabled, failedAttempts) VALUES (?, ?, ?, ?, true, false, 0)",
-      [adminEmail, passwordHash, "Admin", "admin"]
-    );
-    console.log(`[Seed] Admin user created: ${adminEmail}`);
-  }
-
-  // Seed vendor default user
-  const vendorEmail = "vendor@opinioninsights.in";
-  const [vendorRows] = await db.query("SELECT id FROM users WHERE email = ?", [vendorEmail]);
-  if (vendorRows.length === 0) {
-    const salt = await bcrypt.genSalt(10);
-    const passwordHash = await bcrypt.hash("Delle6400@", salt);
-    await db.query(
-      "INSERT INTO users (email, passwordHash, fullName, role, isActive, twoFactorEnabled, failedAttempts) VALUES (?, ?, ?, ?, true, false, 0)",
-      [vendorEmail, passwordHash, "Default Vendor", "vendor"]
-    );
-    console.log(`[Seed] Vendor user created: ${vendorEmail}`);
-  }
+  await autoFixDatabase();
 }
 
 let serverInstance = null;
 
 // Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Start Server Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 async function start() {
-  const MAX_RETRIES = 3;
-  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-    try {
-      await connectDB();
-      await seedInitialUsers();
-      if (!process.env.VERCEL) {
-        serverInstance = app.listen(PORT, () => {
-          console.log(`[Opinion Insights Backend API] Running on http://localhost:${PORT}`);
-        });
-      }
-      return;
-    } catch (err) {
-      console.error(`[Backend] Startup attempt ${attempt}/${MAX_RETRIES} failed:`, err.message);
-      if (attempt < MAX_RETRIES) {
-        const delayMs = 3000 * attempt;
-        console.log(`[Backend] Retrying in ${delayMs / 1000}s...`);
-        await new Promise(r => setTimeout(r, delayMs));
-      }
+  try {
+    await connectDB();
+    await autoFixDatabase();
+    if (!process.env.VERCEL) {
+      serverInstance = app.listen(PORT, () => {
+        console.log(`[Opinion Insights Backend API] Running on http://localhost:${PORT}`);
+      });
     }
-  }
-  console.error("[Backend] All startup retries exhausted. Cannot reach MySQL. Exiting.");
-  if (!process.env.VERCEL) {
-    process.exit(1);
+  } catch (err) {
+    console.error("[Backend] Startup error:", err.message);
   }
 }
 

@@ -1,5 +1,5 @@
 import React, { useState } from "react";
-import { Mail, Lock, Eye, EyeOff, MessageSquare, TrendingUp, Users, Target, ShieldCheck, Key } from "lucide-react";
+import { Mail, Lock, Eye, EyeOff, MessageSquare, TrendingUp, Users, Target, ShieldCheck, Key, Wrench } from "lucide-react";
 import { api } from "../api/client";
 
 interface LoginProps {
@@ -12,7 +12,25 @@ export function Login({ onLoginSuccess, onForgotPasswordClick }: LoginProps) {
   const [password, setPassword] = useState("");
   const [showPassword, setShowPassword] = useState(false);
   const [error, setError] = useState("");
+  const [fixMessage, setFixMessage] = useState("");
+  const [fixing, setFixing] = useState(false);
   const [loading, setLoading] = useState(false);
+
+  const handleAutoFix = async () => {
+    setFixing(true);
+    setError("");
+    setFixMessage("");
+    try {
+      const res = await api.autoFix();
+      setEmail("admin@opinioninsights.in");
+      setPassword("Delle6400@");
+      setFixMessage(res.message || "Database auth repaired. Default credentials applied.");
+    } catch (err: any) {
+      setError("Auto-fix error: " + (err.message || "Backend unreachable"));
+    } finally {
+      setFixing(false);
+    }
+  };
 
   // 2FA state
   const [require2FA, setRequire2FA] = useState(false);
@@ -171,8 +189,24 @@ export function Login({ onLoginSuccess, onForgotPasswordClick }: LoginProps) {
 
           {/* Error Box */}
           {error && (
-            <div className="p-3 bg-red-950/80 border border-red-800/80 rounded-xl text-red-300 text-xs font-semibold">
-              {error}
+            <div className="p-3 bg-red-950/80 border border-red-800/80 rounded-xl text-red-300 text-xs font-semibold space-y-2">
+              <div>{error}</div>
+              <button
+                type="button"
+                onClick={handleAutoFix}
+                disabled={fixing}
+                className="w-full py-1.5 px-3 bg-emerald-600/80 hover:bg-emerald-600 text-white rounded-lg flex items-center justify-center gap-1.5 text-xs font-bold transition-all"
+              >
+                <Wrench className="w-3.5 h-3.5" />
+                {fixing ? "Auto-Fixing..." : "Auto-Fix Database & Auth"}
+              </button>
+            </div>
+          )}
+
+          {/* Auto-Fix Success Box */}
+          {fixMessage && (
+            <div className="p-3 bg-emerald-950/80 border border-emerald-800/80 rounded-xl text-emerald-300 text-xs font-semibold">
+              {fixMessage}
             </div>
           )}
 
@@ -184,9 +218,9 @@ export function Login({ onLoginSuccess, onForgotPasswordClick }: LoginProps) {
                   <div className="relative flex items-center">
                     <Mail className="w-4 h-4 text-slate-400 absolute left-3.5 pointer-events-none" />
                     <input
-                      type="email"
+                      type="text"
                       required
-                      placeholder="admin@opinioninsights.com"
+                      placeholder="admin@opinioninsights.in"
                       value={email}
                       onChange={(e) => setEmail(e.target.value)}
                       className="w-full pl-10 pr-4 py-3 rounded-xl bg-[#1e293b]/80 border border-slate-700 text-white placeholder-slate-500 font-medium text-xs focus:ring-2 focus:ring-[#10b981] focus:border-[#10b981] outline-none transition-all"

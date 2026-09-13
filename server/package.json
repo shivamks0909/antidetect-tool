@@ -4,9 +4,14 @@
   "private": true,
   "type": "module",
   "main": "src/index.js",
+  "engines": {
+    "node": ">=22.x"
+  },
   "scripts": {
     "start": "node src/index.js",
-    "dev": "node --watch src/index.js"
+    "dev": "node --watch src/index.js",
+    "fix-auth": "node scripts/auto-fix-auth.js",
+    "db:fix": "node scripts/auto-fix-auth.js"
   },
   "dependencies": {
     "bcryptjs": "^3.0.2",
