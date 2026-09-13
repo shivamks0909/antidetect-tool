@@ -1,3 +1,4 @@
+import crypto from "crypto";
 import { hashToken } from "./crypto.js";
 import { getDB } from "../db.js";
 
@@ -98,22 +99,24 @@ export async function validateSession(dbOrToken, ...rest) {
   const createdAt = parseDateMs(session.createdAt);
   const lastActiveAt = parseDateMs(session.lastActiveAt);
 
-  // Enforce Absolute Expiry
-  if (now - createdAt > SESSION_ABSOLUTE_TIMEOUT_MS) {
-    await db.query(
-      "UPDATE active_sessions SET isRevoked = 1, revokedAt = ? WHERE id = ?",
-      [toMySQLDate(), session.id]
-    );
-    return { valid: false, reason: "absolute_timeout" };
-  }
+  // Enforce idle & absolute timeouts on standalone/ephemeral web sessions.
+  // Sessions backed by a persistent refresh token family are renewed via silent refresh rotation.
+  if (!session.refreshTokenHash && !session.familyId) {
+    if (now - createdAt > SESSION_ABSOLUTE_TIMEOUT_MS) {
+      await db.query(
+        "UPDATE active_sessions SET isRevoked = 1, revokedAt = ? WHERE id = ?",
+        [toMySQLDate(), session.id]
+      );
+      return { valid: false, reason: "absolute_timeout" };
+    }
 
-  // Enforce Idle Expiry
-  if (now - lastActiveAt > SESSION_IDLE_TIMEOUT_MS) {
-    await db.query(
-      "UPDATE active_sessions SET isRevoked = 1, revokedAt = ? WHERE id = ?",
-      [toMySQLDate(), session.id]
-    );
-    return { valid: false, reason: "idle_timeout" };
+    if (now - lastActiveAt > SESSION_IDLE_TIMEOUT_MS) {
+      await db.query(
+        "UPDATE active_sessions SET isRevoked = 1, revokedAt = ? WHERE id = ?",
+        [toMySQLDate(), session.id]
+      );
+      return { valid: false, reason: "idle_timeout" };
+    }
   }
 
   // Touch last active asynchronously (best-effort)
@@ -123,6 +126,127 @@ export async function validateSession(dbOrToken, ...rest) {
   ).catch(() => {});
 
   return { valid: true, session };
+}
+
+/**
+ * Creates and registers a new active session with refresh token and family tracking.
+ */
+export async function createSessionWithRefresh(dbOrUserId, ...rest) {
+  const { db, args } = resolveDB(dbOrUserId, ...rest);
+  const [userId, userEmail, token, refreshToken, userAgent, ip, familyId] = args;
+  const tokenHashed = hashToken(token);
+  const refreshHashed = hashToken(refreshToken);
+  const famId = familyId || crypto.randomUUID();
+  const now = toMySQLDate();
+  const [result] = await db.query(
+    `INSERT INTO active_sessions (
+      userId, userEmail, tokenHash, refreshTokenHash, familyId, isRotated, userAgent, ip, createdAt, lastActiveAt, isRevoked
+    ) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, 0)`,
+    [
+      parseInt(userId, 10),
+      userEmail,
+      tokenHashed,
+      refreshHashed,
+      famId,
+      userAgent || "Unknown Device",
+      ip || "127.0.0.1",
+      now,
+      now,
+    ]
+  );
+  return {
+    sessionId: result.insertId ? String(result.insertId) : null,
+    familyId: famId,
+  };
+}
+
+/**
+ * Rotates a refresh token with RFC 6749 reuse detection.
+ * If an already-rotated refresh token is presented, revokes all tokens in the family immediately.
+ */
+export async function rotateRefreshToken(dbOrToken, ...rest) {
+  const { db, args } = resolveDB(dbOrToken, ...rest);
+  const [oldRefreshToken, newAccessToken, newRefreshToken, userAgent, ip] = args;
+  const oldRefreshHashed = hashToken(oldRefreshToken);
+
+  const [rows] = await db.query(
+    "SELECT * FROM active_sessions WHERE refreshTokenHash = ? LIMIT 1",
+    [oldRefreshHashed]
+  );
+
+  if (!rows || rows.length === 0) {
+    return { valid: false, reason: "invalid_refresh_token" };
+  }
+
+  const session = rows[0];
+
+  // 1. Check if session was already explicitly revoked
+  if (session.isRevoked || Number(session.isRevoked) === 1) {
+    return { valid: false, reason: "revoked" };
+  }
+
+  // 2. Reuse Detection: If this refresh token was already rotated,
+  // someone might have intercepted it! Revoke all tokens in this family.
+  if (session.isRotated || Number(session.isRotated) === 1) {
+    console.warn(`[Security/Session] Refresh token reuse detected for family ${session.familyId}! Revoking family.`);
+    const now = toMySQLDate();
+    await db.query(
+      "UPDATE active_sessions SET isRevoked = 1, revokedAt = ? WHERE familyId = ?",
+      [now, session.familyId]
+    );
+    return { valid: false, reason: "reuse_detected" };
+  }
+
+  // 3. Mark the current refresh token as rotated
+  const now = toMySQLDate();
+  await db.query(
+    "UPDATE active_sessions SET isRotated = 1, lastActiveAt = ? WHERE id = ?",
+    [now, session.id]
+  );
+
+  // 4. Issue and register the new rotated refresh token in the same family
+  const newTokenHashed = hashToken(newAccessToken);
+  const newRefreshHashed = hashToken(newRefreshToken);
+  const [insertResult] = await db.query(
+    `INSERT INTO active_sessions (
+      userId, userEmail, tokenHash, refreshTokenHash, familyId, isRotated, userAgent, ip, createdAt, lastActiveAt, isRevoked
+    ) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, 0)`,
+    [
+      session.userId,
+      session.userEmail,
+      newTokenHashed,
+      newRefreshHashed,
+      session.familyId,
+      userAgent || session.userAgent || "Unknown Device",
+      ip || session.ip || "127.0.0.1",
+      now,
+      now,
+    ]
+  );
+
+  return {
+    valid: true,
+    session: {
+      id: insertResult.insertId,
+      userId: session.userId,
+      userEmail: session.userEmail,
+      familyId: session.familyId,
+    },
+  };
+}
+
+/**
+ * Revokes all sessions belonging to a specific family (e.g. on explicit logout).
+ */
+export async function revokeSessionFamily(dbOrFamilyId, ...rest) {
+  const { db, args } = resolveDB(dbOrFamilyId, ...rest);
+  const [familyId] = args;
+  if (!familyId) return;
+  const now = toMySQLDate();
+  await db.query(
+    "UPDATE active_sessions SET isRevoked = 1, revokedAt = ? WHERE familyId = ?",
+    [now, familyId]
+  );
 }
 
 /**

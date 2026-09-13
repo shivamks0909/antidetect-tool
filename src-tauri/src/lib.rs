@@ -117,10 +117,28 @@ async fn auth_logout() -> Result<bool, String> {
     if let Ok(mut g) = auth_cell().write() {
         *g = None;
     }
+    let _ = store::clear_secure_auth_session();
     // Rotate the Axum API signing secret so any JWT tokens issued during the
     // previous session are immediately invalid — even though the server
     // continues listening (it cannot be stopped without process restart).
     crate::api::set_secret(&uuid::Uuid::new_v4().simple().to_string());
+    Ok(true)
+}
+
+#[tauri::command]
+fn auth_save_secure_session(session_json: String) -> Result<bool, String> {
+    store::save_secure_auth_session(&session_json).map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
+#[tauri::command]
+fn auth_load_secure_session() -> Result<Option<String>, String> {
+    store::load_secure_auth_session().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn auth_clear_secure_session() -> Result<bool, String> {
+    store::clear_secure_auth_session().map_err(|e| e.to_string())?;
     Ok(true)
 }
 
@@ -1885,6 +1903,9 @@ pub fn run() {
             auth_verify_session,
             auth_logout,
             auth_status,
+            auth_save_secure_session,
+            auth_load_secure_session,
+            auth_clear_secure_session,
             kill_all_user_browsers,
             native_http_request,
         ])

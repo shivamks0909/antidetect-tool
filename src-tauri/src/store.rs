@@ -308,3 +308,133 @@ pub fn migrate_legacy_filesystem() -> Result<()> {
     Ok(())
 }
 
+// ─── OS-Protected Secure Session Storage ───
+
+#[cfg(windows)]
+pub fn save_secure_auth_session(json: &str) -> Result<()> {
+    use windows_sys::Win32::Security::Cryptography::{CryptProtectData, CRYPT_INTEGER_BLOB};
+    use windows_sys::Win32::Foundation::LocalFree;
+
+    let path = config_root()?.join("session.enc");
+    let input = json.as_bytes();
+    let in_blob = CRYPT_INTEGER_BLOB {
+        cbData: input.len() as u32,
+        pbData: input.as_ptr() as *mut u8,
+    };
+    let mut out_blob = CRYPT_INTEGER_BLOB {
+        cbData: 0,
+        pbData: std::ptr::null_mut(),
+    };
+    let ok = unsafe {
+        CryptProtectData(
+            &in_blob,
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+            &mut out_blob,
+        )
+    };
+    if ok == 0 {
+        return Err(anyhow::anyhow!("Failed to protect session with Windows DPAPI"));
+    }
+    let encrypted = unsafe {
+        let slice = std::slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize);
+        let data = slice.to_vec();
+        LocalFree(out_blob.pbData as _);
+        data
+    };
+    std::fs::write(&path, encrypted)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+pub fn load_secure_auth_session() -> Result<Option<String>> {
+    use windows_sys::Win32::Security::Cryptography::{CryptUnprotectData, CRYPT_INTEGER_BLOB};
+    use windows_sys::Win32::Foundation::LocalFree;
+
+    let path = config_root()?.join("session.enc");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let encrypted = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("[store] failed to read session.enc: {e}");
+            return Ok(None);
+        }
+    };
+    if encrypted.is_empty() {
+        return Ok(None);
+    }
+    let in_blob = CRYPT_INTEGER_BLOB {
+        cbData: encrypted.len() as u32,
+        pbData: encrypted.as_ptr() as *mut u8,
+    };
+    let mut out_blob = CRYPT_INTEGER_BLOB {
+        cbData: 0,
+        pbData: std::ptr::null_mut(),
+    };
+    let ok = unsafe {
+        CryptUnprotectData(
+            &in_blob,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+            &mut out_blob,
+        )
+    };
+    if ok == 0 {
+        eprintln!("[store] Windows DPAPI unprotect failed; session may be corrupted or from different Windows user");
+        let _ = std::fs::remove_file(&path);
+        return Ok(None);
+    }
+    let decrypted = unsafe {
+        let slice = std::slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize);
+        let data = slice.to_vec();
+        LocalFree(out_blob.pbData as _);
+        data
+    };
+    let json = String::from_utf8(decrypted).context("Invalid UTF-8 in decrypted session")?;
+    Ok(Some(json))
+}
+
+#[cfg(windows)]
+pub fn clear_secure_auth_session() -> Result<()> {
+    let path = config_root()?.join("session.enc");
+    if path.exists() {
+        let _ = std::fs::write(&path, [0u8; 64]);
+        let _ = std::fs::remove_file(&path);
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub fn save_secure_auth_session(json: &str) -> Result<()> {
+    let path = config_root()?.join("session.enc");
+    std::fs::write(&path, json)?;
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub fn load_secure_auth_session() -> Result<Option<String>> {
+    let path = config_root()?.join("session.enc");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let json = std::fs::read_to_string(&path)?;
+    Ok(Some(json))
+}
+
+#[cfg(not(windows))]
+pub fn clear_secure_auth_session() -> Result<()> {
+    let path = config_root()?.join("session.enc");
+    if path.exists() {
+        let _ = std::fs::remove_file(&path);
+    }
+    Ok(())
+}
+

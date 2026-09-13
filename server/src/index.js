@@ -24,6 +24,9 @@ import {
 } from "./security/crypto.js";
 import {
   createSession,
+  createSessionWithRefresh,
+  rotateRefreshToken,
+  revokeSessionFamily,
   validateSession,
   revokeSession,
   revokeSessionById,
@@ -508,7 +511,7 @@ export async function authenticateToken(req, res, next) {
     next();
   } catch (err) {
     if (err.name === "JsonWebTokenError" || err.name === "TokenExpiredError") {
-      return res.status(401).json({ error: "Invalid or expired token." });
+      return res.status(401).json({ error: "Invalid or expired token.", code: "TOKEN_EXPIRED" });
     }
     console.error("[Auth] Unexpected error during token verification:", err.message);
     return res.status(503).json({ error: "Service temporarily unavailable. Please try again." });
@@ -732,16 +735,17 @@ app.post("/api/auth/login", loginRateLimiter, async (req, res) => {
       });
     }
 
-    // Issue session token
+    // Issue short-lived access token (15m) and long-lived refresh token
     const token = jwt.sign(
       { id: String(user.id), email: user.email, role: user.role, jti: crypto.randomUUID() },
       JWT_SECRET,
-      { expiresIn: "12h" }
+      { expiresIn: "15m" }
     );
 
+    const refreshToken = crypto.randomBytes(32).toString("hex");
     const userAgent = req.headers["user-agent"] || "";
     const ip = req.ip || req.socket.remoteAddress || "";
-    await createSession(String(user.id), user.email, token, userAgent, ip);
+    await createSessionWithRefresh(db, String(user.id), user.email, token, refreshToken, userAgent, ip);
 
     await recordAuditLog(String(user.id), user.email, "LOGIN_SUCCESS", null, { role: user.role });
 
@@ -756,6 +760,7 @@ app.post("/api/auth/login", loginRateLimiter, async (req, res) => {
     res.json({
       success: true,
       token,
+      refreshToken,
       user: {
         id: String(user.id),
         email: user.email,
@@ -822,15 +827,17 @@ app.post("/api/auth/login/2fa", loginRateLimiter, async (req, res) => {
       return res.status(401).json({ error: "Invalid 2FA code or recovery code." });
     }
 
+    // Issue short-lived access token (15m) and long-lived refresh token
     const token = jwt.sign(
       { id: String(user.id), email: user.email, role: user.role, jti: crypto.randomUUID() },
       JWT_SECRET,
-      { expiresIn: "12h" }
+      { expiresIn: "15m" }
     );
 
+    const refreshToken = crypto.randomBytes(32).toString("hex");
     const userAgent = req.headers["user-agent"] || "";
     const ip = req.ip || req.socket.remoteAddress || "";
-    await createSession(String(user.id), user.email, token, userAgent, ip);
+    await createSessionWithRefresh(db, String(user.id), user.email, token, refreshToken, userAgent, ip);
 
     await recordAuditLog(
       String(user.id),
@@ -851,6 +858,7 @@ app.post("/api/auth/login/2fa", loginRateLimiter, async (req, res) => {
     res.json({
       success: true,
       token,
+      refreshToken,
       user: {
         id: String(user.id),
         email: user.email,
@@ -862,6 +870,92 @@ app.post("/api/auth/login/2fa", loginRateLimiter, async (req, res) => {
     });
   } catch (err) {
     res.status(401).json({ error: "Invalid or expired 2FA session token." });
+  }
+});
+
+// Refresh Token Endpoint (Silent Renewal with Rotation & Reuse Detection)
+app.post("/api/auth/refresh", async (req, res) => {
+  const refreshToken = req.body?.refreshToken || req.headers["x-refresh-token"];
+  if (!refreshToken || typeof refreshToken !== "string") {
+    return res.status(400).json({ error: "Missing refresh token.", code: "MISSING_TOKEN" });
+  }
+
+  try {
+    const db = await ensureDB();
+    const userAgent = req.headers["user-agent"] || "";
+    const ip = req.ip || req.socket.remoteAddress || "";
+
+    const oldHash = hashToken(refreshToken);
+    const [rows] = await db.query(
+      "SELECT * FROM active_sessions WHERE refreshTokenHash = ? LIMIT 1",
+      [oldHash]
+    );
+
+    if (!rows || rows.length === 0) {
+      return res.status(401).json({ error: "Invalid refresh token.", code: "INVALID_TOKEN" });
+    }
+
+    const currentSession = rows[0];
+
+    // Check user in database
+    const [users] = await db.query("SELECT * FROM users WHERE id = ? LIMIT 1", [currentSession.userId]);
+    const user = users[0];
+    if (!user || !user.isActive || Number(user.isActive) === 0) {
+      await revokeAllUserSessions(db, currentSession.userId);
+      return res.status(403).json({ error: "Your account has been deactivated.", code: "ACCOUNT_DISABLED" });
+    }
+
+    // Issue new 15-minute access token
+    const newAccessToken = jwt.sign(
+      { id: String(user.id), email: user.email, role: user.role, jti: crypto.randomUUID() },
+      JWT_SECRET,
+      { expiresIn: "15m" }
+    );
+
+    // Perform atomic rotation with reuse detection
+    const newRefreshToken = crypto.randomBytes(32).toString("hex");
+    const rotationResult = await rotateRefreshToken(db, refreshToken, newAccessToken, newRefreshToken, userAgent, ip);
+
+    if (!rotationResult.valid) {
+      if (rotationResult.reason === "reuse_detected") {
+        await recordAuditLog(String(user.id), user.email, "REFRESH_TOKEN_REUSE_DETECTED", null, { familyId: currentSession.familyId });
+        return res.status(401).json({
+          error: "Refresh token reuse detected. Session invalidated for security.",
+          code: "REUSE_DETECTED",
+        });
+      }
+      return res.status(401).json({
+        error: "Session has been revoked or expired.",
+        code: "REVOKED",
+      });
+    }
+
+    await recordAuditLog(String(user.id), user.email, "TOKEN_REFRESH_SUCCESS", null);
+
+    res.cookie("admin_session", newAccessToken, {
+      httpOnly: true,
+      secure: true,
+      sameSite: "none",
+      path: "/",
+      maxAge: 12 * 60 * 60 * 1000,
+    });
+
+    res.json({
+      success: true,
+      token: newAccessToken,
+      refreshToken: newRefreshToken,
+      user: {
+        id: String(user.id),
+        email: user.email,
+        full_name: user.fullName,
+        role: user.role,
+        is_active: Boolean(user.isActive),
+        twoFactorEnabled: Boolean(user.twoFactorEnabled),
+      },
+    });
+  } catch (err) {
+    console.error("[Auth] Token refresh error:", err);
+    res.status(500).json({ error: "Internal server error during token refresh." });
   }
 });
 
@@ -877,11 +971,33 @@ app.get("/api/auth/me", authenticateToken, async (req, res) => {
   });
 });
 
-// Logout (Revokes current session)
-app.post("/api/auth/logout", authenticateToken, async (req, res) => {
+// Logout (Revokes current session & refresh token family)
+app.post("/api/auth/logout", async (req, res) => {
   try {
-    await revokeSession(req.token);
-    await recordAuditLog(req.user.id, req.user.email, "LOGOUT", null);
+    const db = await ensureDB();
+    const authHeader = req.headers["authorization"];
+    const token = authHeader && authHeader.split(" ")[1];
+    const refreshToken = req.body?.refreshToken;
+
+    if (token) {
+      try {
+        await revokeSession(db, token);
+      } catch (_) {}
+    }
+
+    if (refreshToken) {
+      try {
+        const refreshHashed = hashToken(refreshToken);
+        const [rows] = await db.query(
+          "SELECT familyId FROM active_sessions WHERE refreshTokenHash = ? LIMIT 1",
+          [refreshHashed]
+        );
+        if (rows && rows.length > 0 && rows[0].familyId) {
+          await revokeSessionFamily(db, rows[0].familyId);
+        }
+      } catch (_) {}
+    }
+
     res.clearCookie("admin_session", {
       httpOnly: true,
       secure: true,

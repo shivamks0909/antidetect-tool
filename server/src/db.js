@@ -63,6 +63,9 @@ CREATE TABLE IF NOT EXISTS active_sessions (
   userId INT NOT NULL,
   userEmail VARCHAR(255) DEFAULT '',
   tokenHash VARCHAR(255) NOT NULL,
+  refreshTokenHash VARCHAR(255) DEFAULT NULL,
+  familyId VARCHAR(255) DEFAULT NULL,
+  isRotated BOOLEAN NOT NULL DEFAULT FALSE,
   userAgent VARCHAR(500) DEFAULT '',
   ip VARCHAR(50) DEFAULT '',
   isRevoked BOOLEAN NOT NULL DEFAULT FALSE,
@@ -72,6 +75,8 @@ CREATE TABLE IF NOT EXISTS active_sessions (
   expiresAt DATETIME DEFAULT NULL,
   FOREIGN KEY (userId) REFERENCES users(id) ON DELETE CASCADE,
   INDEX idx_tokenHash (tokenHash),
+  INDEX idx_refreshTokenHash (refreshTokenHash),
+  INDEX idx_familyId (familyId),
   INDEX idx_userId (userId)
 );
 
@@ -261,6 +266,9 @@ CREATE TABLE IF NOT EXISTS active_sessions (
   userId INTEGER NOT NULL,
   userEmail TEXT DEFAULT '',
   tokenHash TEXT NOT NULL,
+  refreshTokenHash TEXT DEFAULT NULL,
+  familyId TEXT DEFAULT NULL,
+  isRotated INTEGER NOT NULL DEFAULT 0,
   userAgent TEXT DEFAULT '',
   ip TEXT DEFAULT '',
   isRevoked INTEGER NOT NULL DEFAULT 0,
@@ -456,6 +464,22 @@ function initSqlite() {
     const cols = sqliteDb.prepare("PRAGMA table_info(profile_proxies)").all();
     if (cols && !cols.some(c => c.name === "location_label")) {
       sqliteDb.exec("ALTER TABLE profile_proxies ADD COLUMN location_label TEXT DEFAULT NULL");
+    }
+  } catch (_) {}
+
+  // Ensure refresh token columns exist in existing active_sessions table
+  try {
+    const sessionCols = sqliteDb.prepare("PRAGMA table_info(active_sessions)").all();
+    if (sessionCols) {
+      if (!sessionCols.some(c => c.name === "refreshTokenHash")) {
+        sqliteDb.exec("ALTER TABLE active_sessions ADD COLUMN refreshTokenHash TEXT DEFAULT NULL");
+      }
+      if (!sessionCols.some(c => c.name === "familyId")) {
+        sqliteDb.exec("ALTER TABLE active_sessions ADD COLUMN familyId TEXT DEFAULT NULL");
+      }
+      if (!sessionCols.some(c => c.name === "isRotated")) {
+        sqliteDb.exec("ALTER TABLE active_sessions ADD COLUMN isRotated INTEGER NOT NULL DEFAULT 0");
+      }
     }
   } catch (_) {}
 

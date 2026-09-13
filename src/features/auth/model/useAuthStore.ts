@@ -1,6 +1,6 @@
 import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
-import { API_BASE, apiFetch } from "../../../config/api";
+import { API_BASE, apiFetch, registerAuthBridge } from "../../../config/api";
 import { useProfile } from "../../../entities/profile";
 import { useProxy } from "../../../entities/proxy";
 import { useBookmarks } from "../../../entities/bookmark";
@@ -22,16 +22,21 @@ export interface UserProfile {
 }
 
 export type AuthStatus =
-  | "loading"
+  | "restoring"
   | "authenticated"
-  | "unauthenticated"
+  | "refreshing"
+  | "reauth_required"
+  | "signed_out"
   | "deactivated"
+  | "loading"
+  | "unauthenticated"
   | "unconfigured";
 
 export interface AuthState {
   user: AuthUser | null;
   profile: UserProfile | null;
   token: string | null;
+  refreshToken: string | null;
   status: AuthStatus;
   error: string | null;
   isBusy: boolean;
@@ -39,6 +44,8 @@ export interface AuthState {
   tempToken: string | null;
 
   init: () => Promise<void>;
+  refreshSession: () => Promise<boolean>;
+  getValidAccessToken: () => Promise<string | null>;
   signIn: (email: string, password: string) => Promise<boolean>;
   verify2FA: (code: string) => Promise<boolean>;
   cancel2FA: () => void;
@@ -46,6 +53,85 @@ export interface AuthState {
   clearError: () => void;
   startHeartbeat: () => void;
   stopHeartbeat: () => void;
+}
+
+export interface SecureSessionPayload {
+  token: string;
+  refreshToken: string;
+  user: AuthUser;
+  profile: UserProfile;
+  savedAt: number;
+}
+
+async function safeInvoke(cmd: string, args?: Record<string, any>): Promise<any> {
+  if (typeof window !== "undefined" && ("__TAURI_INTERNALS__" in window || "__TAURI__" in window)) {
+    try {
+      return await invoke(cmd, args);
+    } catch (e) {
+      console.warn(`[auth] safeInvoke ${cmd} failed:`, e);
+      return null;
+    }
+  }
+  return null;
+}
+
+async function persistSecureSession(payload: SecureSessionPayload): Promise<void> {
+  const json = JSON.stringify(payload);
+  const ok = await safeInvoke("auth_save_secure_session", { sessionJson: json });
+  if (!ok) {
+    try {
+      sessionStorage.setItem("__oi_secure_sess", json);
+    } catch (_) {}
+  }
+  try {
+    localStorage.setItem("opinion_jwt_token", payload.token);
+  } catch (_) {}
+}
+
+async function loadSecureSession(): Promise<SecureSessionPayload | null> {
+  const json = await safeInvoke("auth_load_secure_session");
+  if (json && typeof json === "string") {
+    try {
+      return JSON.parse(json);
+    } catch (e) {
+      console.warn("[auth] Failed to parse secure session:", e);
+    }
+  }
+
+  // Web fallback for development
+  try {
+    const webFallback = sessionStorage.getItem("__oi_secure_sess");
+    if (webFallback) return JSON.parse(webFallback);
+  } catch (_) {}
+
+  // Fallback to legacy localStorage token if present
+  try {
+    const legacyToken = localStorage.getItem("opinion_jwt_token");
+    if (legacyToken) {
+      return {
+        token: legacyToken,
+        refreshToken: "",
+        user: { id: "legacy", email: "" },
+        profile: { id: "legacy", email: "", is_active: true },
+        savedAt: Date.now(),
+      };
+    }
+  } catch (_) {}
+
+  return null;
+}
+
+async function wipeSecureSession(): Promise<void> {
+  await safeInvoke("auth_clear_secure_session");
+  try {
+    sessionStorage.removeItem("__oi_secure_sess");
+  } catch (_) {}
+  try {
+    localStorage.removeItem("opinion_jwt_token");
+    localStorage.removeItem("oi_mock_profiles");
+    localStorage.removeItem("oi_mock_proxies");
+    localStorage.removeItem("shardx-folders");
+  } catch (_) {}
 }
 
 export const resetUserSessionState = () => {
@@ -59,28 +145,113 @@ export const resetUserSessionState = () => {
   } catch (e) {
     console.warn("[auth] error resetting user stores:", e);
   }
-  try {
-    localStorage.removeItem("opinion_jwt_token");
-    localStorage.removeItem("oi_mock_profiles");
-    localStorage.removeItem("oi_mock_proxies");
-    localStorage.removeItem("shardx-folders");
-  } catch {}
+  wipeSecureSession().catch(() => {});
 };
-
-async function safeInvoke(cmd: string, args?: Record<string, any>): Promise<any> {
-  if (typeof window !== "undefined" && "__TAURI_INTERNALS__" in window) {
-    try {
-      return await invoke(cmd, args);
-    } catch (e) {
-      console.warn(`[auth] safeInvoke ${cmd} failed:`, e);
-      return null;
-    }
-  }
-  return null;
-}
 
 let heartbeatTimer: any = null;
 let consecutiveNetworkFails = 0;
+let activeRefreshPromise: Promise<boolean> | null = null;
+
+export const refreshAuthSession = async (): Promise<boolean> => {
+  if (activeRefreshPromise) {
+    return activeRefreshPromise;
+  }
+
+  activeRefreshPromise = (async () => {
+    const store = useAuthStore.getState();
+    let currentRefreshToken = store.refreshToken;
+
+    if (!currentRefreshToken) {
+      const diskSession = await loadSecureSession();
+      if (diskSession?.refreshToken) {
+        currentRefreshToken = diskSession.refreshToken;
+      }
+    }
+
+    if (!currentRefreshToken) {
+      console.warn("[auth] No refresh token available for silent renewal");
+      return false;
+    }
+
+    try {
+      const res = await apiFetch(`${API_BASE}/auth/refresh`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ refreshToken: currentRefreshToken }),
+      });
+
+      if (res.status === 401 || res.status === 403) {
+        const data = await res.json().catch(() => ({}));
+        if (data.code === "ACCOUNT_DISABLED") {
+          await useAuthStore.getState().signOut();
+          useAuthStore.setState({
+            status: "deactivated",
+            error: "Your account has been deactivated. Please contact your administrator.",
+          });
+          return false;
+        }
+
+        // True revocation or token reuse detected -> explicit sign-out
+        console.warn("[auth] Refresh token explicitly rejected by server:", data.code || res.status);
+        await wipeSecureSession();
+        await safeInvoke("auth_logout");
+        useAuthStore.setState({
+          user: null,
+          profile: null,
+          token: null,
+          refreshToken: null,
+          status: "signed_out",
+          error: "Session expired. Please sign in again.",
+        });
+        return false;
+      }
+
+      if (res.ok) {
+        const data = await res.json();
+        const newToken = data.token;
+        const newRefreshToken = data.refreshToken;
+        const userObj = data.user;
+
+        await persistSecureSession({
+          token: newToken,
+          refreshToken: newRefreshToken,
+          user: { id: userObj.id, email: userObj.email },
+          profile: userObj,
+          savedAt: Date.now(),
+        });
+
+        await safeInvoke("auth_verify_session", {
+          token: newToken,
+          userId: userObj.id,
+          email: userObj.email,
+        });
+
+        useAuthStore.setState({
+          token: newToken,
+          refreshToken: newRefreshToken,
+          user: { id: userObj.id, email: userObj.email },
+          profile: userObj,
+          status: "authenticated",
+          error: null,
+        });
+
+        return true;
+      }
+
+      // 5xx server cold start or unexpected code -> do NOT log out!
+      console.warn(`[auth] Refresh endpoint returned status ${res.status}; retaining session in offline mode`);
+      return false;
+    } catch (netErr) {
+      // Network transport failure (e.g. sleep/wake, WiFi glitch) -> do NOT log out!
+      console.warn("[auth] Refresh request network failure; retaining session in offline mode:", netErr);
+      return false;
+    } finally {
+      activeRefreshPromise = null;
+    }
+  })();
+
+  return activeRefreshPromise;
+};
 
 export const useAuthStore = create<AuthState>((set, get) => {
   const handleDeactivation = async (reason?: string) => {
@@ -92,6 +263,7 @@ export const useAuthStore = create<AuthState>((set, get) => {
       user: null,
       profile: null,
       token: null,
+      refreshToken: null,
       status: "deactivated",
       error: reason || "Your account has been deactivated. Please contact your administrator.",
       isBusy: false,
@@ -104,7 +276,8 @@ export const useAuthStore = create<AuthState>((set, get) => {
     user: null,
     profile: null,
     token: null,
-    status: "loading",
+    refreshToken: null,
+    status: "restoring",
     error: null,
     isBusy: false,
     require2FA: false,
@@ -112,27 +285,48 @@ export const useAuthStore = create<AuthState>((set, get) => {
 
     clearError: () => set({ error: null }),
 
+    refreshSession: refreshAuthSession,
+
+    getValidAccessToken: async () => {
+      const currentToken = get().token;
+      if (currentToken) return currentToken;
+      const refreshed = await refreshAuthSession();
+      if (refreshed) return get().token;
+      return null;
+    },
+
     startHeartbeat: () => {
       if (heartbeatTimer) clearInterval(heartbeatTimer);
       consecutiveNetworkFails = 0;
 
       heartbeatTimer = setInterval(async () => {
-        const storedToken = localStorage.getItem("opinion_jwt_token");
-        if (!storedToken) {
+        const currentToken = get().token || localStorage.getItem("opinion_jwt_token");
+        if (!currentToken) {
           get().stopHeartbeat();
           return;
         }
 
         try {
           const res = await apiFetch(`${API_BASE}/auth/me`, {
-            headers: { Authorization: `Bearer ${storedToken}` },
+            headers: { Authorization: `Bearer ${currentToken}` },
           });
 
-          // Reset network fails count on receiving any HTTP response from server
           consecutiveNetworkFails = 0;
 
-          if (res.status === 401 || res.status === 403) {
-            await handleDeactivation("Your account has been deactivated or session revoked.");
+          if (res.status === 401) {
+            // Access token expired or invalid -> trigger silent background refresh!
+            const refreshed = await refreshAuthSession();
+            if (!refreshed) {
+              // If refresh explicitly failed and cleared session, heartbeat is done
+              if (get().status === "signed_out" || get().status === "deactivated") {
+                get().stopHeartbeat();
+              }
+            }
+            return;
+          }
+
+          if (res.status === 403) {
+            await handleDeactivation("Your account has been deactivated or access revoked.");
             return;
           }
 
@@ -145,10 +339,10 @@ export const useAuthStore = create<AuthState>((set, get) => {
           }
         } catch (netErr) {
           consecutiveNetworkFails++;
-          // Network transport glitch (e.g. WiFi flap): do NOT log out user!
-          console.warn(`[auth] Heartbeat network glitch (#${consecutiveNetworkFails}):`, netErr);
+          // Network transport glitch (e.g. computer sleep, WiFi disconnect): NEVER log out!
+          console.warn(`[auth] Heartbeat transport notice (#${consecutiveNetworkFails}):`, netErr);
         }
-      }, 45000); // 45 seconds interval
+      }, 60000); // 60 seconds interval
     },
 
     stopHeartbeat: () => {
@@ -159,57 +353,87 @@ export const useAuthStore = create<AuthState>((set, get) => {
     },
 
     init: async () => {
-      const storedToken = localStorage.getItem("opinion_jwt_token");
-      if (!storedToken) {
+      set({ status: "restoring" });
+
+      const storedSession = await loadSecureSession();
+      if (!storedSession || (!storedSession.token && !storedSession.refreshToken)) {
         await safeInvoke("auth_logout");
-        set({ user: null, profile: null, token: null, status: "unauthenticated", require2FA: false, tempToken: null });
-        return;
-      }
-
-      try {
-        const res = await apiFetch(`${API_BASE}/auth/me`, {
-          headers: { Authorization: `Bearer ${storedToken}` },
-        });
-
-        if (!res.ok) {
-          if (res.status === 401 || res.status === 403) {
-            await handleDeactivation("Your account has been deactivated or session revoked.");
-            return;
-          }
-          localStorage.removeItem("opinion_jwt_token");
-          await safeInvoke("auth_logout");
-          set({ user: null, profile: null, token: null, status: "unauthenticated", require2FA: false, tempToken: null });
-          return;
-        }
-
-        const userData = await res.json();
-        if (!userData.is_active) {
-          await handleDeactivation("Your account has been deactivated. Please contact your administrator.");
-          return;
-        }
-
-        await safeInvoke("auth_verify_session", {
-          token: storedToken,
-          userId: userData.id,
-          email: userData.email,
-        });
-
         set({
-          user: { id: userData.id, email: userData.email },
-          profile: userData,
-          token: storedToken,
-          status: "authenticated",
-          error: null,
+          user: null,
+          profile: null,
+          token: null,
+          refreshToken: null,
+          status: "signed_out",
           require2FA: false,
           tempToken: null,
         });
+        return;
+      }
 
-        // Start background security heartbeat
+      // Pre-seed in-memory state from OS secure storage immediately
+      set({
+        user: storedSession.user || null,
+        profile: storedSession.profile || null,
+        token: storedSession.token || null,
+        refreshToken: storedSession.refreshToken || null,
+        status: "authenticated",
+        error: null,
+      });
+
+      if (storedSession.token && storedSession.user?.id) {
+        await safeInvoke("auth_verify_session", {
+          token: storedSession.token,
+          userId: storedSession.user.id,
+          email: storedSession.user.email || "",
+        });
+      }
+
+      // Verify token with backend or silently refresh
+      try {
+        const res = await apiFetch(`${API_BASE}/auth/me`, {
+          headers: { Authorization: `Bearer ${storedSession.token}` },
+        });
+
+        if (res.status === 401) {
+          // Token expired -> perform silent background refresh
+          const refreshed = await refreshAuthSession();
+          if (refreshed) {
+            get().startHeartbeat();
+          }
+          return;
+        }
+
+        if (res.status === 403) {
+          await handleDeactivation("Your account has been deactivated or session revoked.");
+          return;
+        }
+
+        if (res.ok) {
+          const userData = await res.json();
+          if (!userData.is_active) {
+            await handleDeactivation("Your account has been deactivated. Please contact your administrator.");
+            return;
+          }
+
+          set({
+            user: { id: userData.id, email: userData.email },
+            profile: userData,
+            status: "authenticated",
+            error: null,
+          });
+
+          get().startHeartbeat();
+          return;
+        }
+
+        // 5xx error on server: retain current session in offline mode!
+        console.warn(`[auth] Backend check returned ${res.status}; preserving session`);
         get().startHeartbeat();
       } catch (err) {
-        console.error("[auth] Backend session check error:", err);
-        // On network error during init with existing token, allow graceful retry
-        set({ status: "unauthenticated", error: null, require2FA: false, tempToken: null });
+        // Network offline / sleep wake: DO NOT LOG OUT!
+        console.warn("[auth] Backend check network error during init; preserving session:", err);
+        set({ status: "authenticated", error: null });
+        get().startHeartbeat();
       }
     },
 
@@ -229,7 +453,6 @@ export const useAuthStore = create<AuthState>((set, get) => {
           body: JSON.stringify({ email: resolvedEmail, password }),
         });
 
-        // If server experienced cold-start DB error, auto-fix and retry once
         if (!res.ok && res.status >= 500) {
           try {
             await apiFetch(`${API_BASE}/auth/auto-fix`, { method: "POST" });
@@ -251,7 +474,6 @@ export const useAuthStore = create<AuthState>((set, get) => {
           return false;
         }
 
-        // Check if 2FA is required by the backend
         if (data.require2FA) {
           set({
             require2FA: true,
@@ -263,6 +485,7 @@ export const useAuthStore = create<AuthState>((set, get) => {
         }
 
         const token = data.token;
+        const refreshToken = data.refreshToken || "";
         const userObj = data.user;
 
         if (!userObj.is_active) {
@@ -273,7 +496,13 @@ export const useAuthStore = create<AuthState>((set, get) => {
           return false;
         }
 
-        localStorage.setItem("opinion_jwt_token", token);
+        await persistSecureSession({
+          token,
+          refreshToken,
+          user: { id: userObj.id, email: userObj.email },
+          profile: userObj,
+          savedAt: Date.now(),
+        });
 
         await safeInvoke("auth_verify_session", {
           token,
@@ -285,6 +514,7 @@ export const useAuthStore = create<AuthState>((set, get) => {
           user: { id: userObj.id, email: userObj.email },
           profile: userObj,
           token,
+          refreshToken,
           status: "authenticated",
           error: null,
           isBusy: false,
@@ -292,7 +522,6 @@ export const useAuthStore = create<AuthState>((set, get) => {
           tempToken: null,
         });
 
-        // Start background security heartbeat
         get().startHeartbeat();
         return true;
       } catch (err: any) {
@@ -331,6 +560,7 @@ export const useAuthStore = create<AuthState>((set, get) => {
         }
 
         const token = data.token;
+        const refreshToken = data.refreshToken || "";
         const userObj = data.user;
 
         if (!userObj.is_active) {
@@ -341,7 +571,13 @@ export const useAuthStore = create<AuthState>((set, get) => {
           return false;
         }
 
-        localStorage.setItem("opinion_jwt_token", token);
+        await persistSecureSession({
+          token,
+          refreshToken,
+          user: { id: userObj.id, email: userObj.email },
+          profile: userObj,
+          savedAt: Date.now(),
+        });
 
         await safeInvoke("auth_verify_session", {
           token,
@@ -353,6 +589,7 @@ export const useAuthStore = create<AuthState>((set, get) => {
           user: { id: userObj.id, email: userObj.email },
           profile: userObj,
           token,
+          refreshToken,
           status: "authenticated",
           require2FA: false,
           tempToken: null,
@@ -379,17 +616,25 @@ export const useAuthStore = create<AuthState>((set, get) => {
       set({ isBusy: true });
       get().stopHeartbeat();
       const token = get().token || localStorage.getItem("opinion_jwt_token");
-      if (token) {
+      const refreshToken = get().refreshToken;
+
+      if (token || refreshToken) {
         try {
           await apiFetch(`${API_BASE}/auth/logout`, {
             method: "POST",
-            headers: { Authorization: `Bearer ${token}` },
+            headers: {
+              "Content-Type": "application/json",
+              ...(token ? { Authorization: `Bearer ${token}` } : {}),
+            },
+            body: JSON.stringify({ refreshToken }),
           });
         } catch (err) {
           console.warn("[auth] backend session revocation notice:", err);
         }
       }
+
       try {
+        await wipeSecureSession();
         resetUserSessionState();
       } finally {
         await safeInvoke("kill_all_user_browsers");
@@ -398,7 +643,8 @@ export const useAuthStore = create<AuthState>((set, get) => {
           user: null,
           profile: null,
           token: null,
-          status: "unauthenticated",
+          refreshToken: null,
+          status: "signed_out",
           error: null,
           isBusy: false,
           require2FA: false,
@@ -408,3 +654,10 @@ export const useAuthStore = create<AuthState>((set, get) => {
     },
   };
 });
+
+// Bridge token getter and silent refresh handler to centralized network client
+registerAuthBridge(
+  () => useAuthStore.getState().token || (typeof localStorage !== "undefined" ? localStorage.getItem("opinion_jwt_token") : null),
+  refreshAuthSession
+);
+

@@ -18,7 +18,7 @@ export function AuthGate({ children }: AuthGateProps) {
   }, [init]);
 
   // Initial session restoration state
-  if (status === "loading") {
+  if (status === "loading" || status === "restoring") {
     return (
       <div className="flex h-full w-full flex-col items-center justify-center bg-bg-weak-50 text-text-strong-950 select-none">
         <div className="flex flex-col items-center gap-3">
@@ -59,8 +59,8 @@ export function AuthGate({ children }: AuthGateProps) {
     );
   }
 
-  // Unauthenticated / Unconfigured state
-  if (status === "unauthenticated" || status === "unconfigured") {
+  // Unauthenticated / Unconfigured / Signed Out state
+  if (status === "unauthenticated" || status === "unconfigured" || status === "signed_out") {
     return <LoginForm />;
   }
 
