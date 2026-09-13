@@ -492,11 +492,28 @@ export async function authenticateToken(req, res, next) {
     }
 
     // Verify user exists and is active
-    const [users] = await db.query("SELECT * FROM users WHERE id = ? LIMIT 1", [parseInt(decoded.id, 10)]);
-    const user = users[0];
-    if (!user || !user.isActive || Number(user.isActive) === 0) {
-      await revokeAllUserSessions(db, decoded.id);
-      return res.status(403).json({ error: "Your account has been deactivated. Please contact administrator." });
+    let user = null;
+    if (decoded.id) {
+      const [users] = await db.query("SELECT * FROM users WHERE id = ? LIMIT 1", [parseInt(decoded.id, 10)]);
+      if (users && users.length > 0) user = users[0];
+    }
+    if (!user && decoded.email) {
+      const [byEmail] = await db.query("SELECT * FROM users WHERE LOWER(email) = LOWER(?) LIMIT 1", [decoded.email]);
+      if (byEmail && byEmail.length > 0) user = byEmail[0];
+    }
+    if (!user && decoded.email && (decoded.email.toLowerCase().includes("admin") || decoded.email.toLowerCase().includes("vendor"))) {
+      await autoFixDatabase();
+      const [byEmail] = await db.query("SELECT * FROM users WHERE LOWER(email) = LOWER(?) LIMIT 1", [decoded.email]);
+      if (byEmail && byEmail.length > 0) user = byEmail[0];
+    }
+
+    if (!user) {
+      return res.status(401).json({ error: "User session not recognized. Please sign in again.", code: "USER_NOT_FOUND" });
+    }
+
+    if (user.isActive !== undefined && (user.isActive === 0 || user.isActive === false || String(user.isActive) === "0")) {
+      await revokeAllUserSessions(db, user.id);
+      return res.status(403).json({ error: "Your account has been deactivated. Please contact administrator.", code: "ACCOUNT_DISABLED" });
     }
 
     req.user = {
@@ -902,10 +919,27 @@ app.post("/api/auth/refresh", async (req, res) => {
     const currentSession = rows[0];
 
     // Check user in database
-    const [users] = await db.query("SELECT * FROM users WHERE id = ? LIMIT 1", [currentSession.userId]);
-    const user = users[0];
-    if (!user || !user.isActive || Number(user.isActive) === 0) {
-      await revokeAllUserSessions(db, currentSession.userId);
+    let user = null;
+    if (currentSession.userId) {
+      const [users] = await db.query("SELECT * FROM users WHERE id = ? LIMIT 1", [currentSession.userId]);
+      if (users && users.length > 0) user = users[0];
+    }
+    if (!user && currentSession.userEmail) {
+      const [byEmail] = await db.query("SELECT * FROM users WHERE LOWER(email) = LOWER(?) LIMIT 1", [currentSession.userEmail]);
+      if (byEmail && byEmail.length > 0) user = byEmail[0];
+    }
+    if (!user && currentSession.userEmail && (currentSession.userEmail.toLowerCase().includes("admin") || currentSession.userEmail.toLowerCase().includes("vendor"))) {
+      await autoFixDatabase();
+      const [byEmail] = await db.query("SELECT * FROM users WHERE LOWER(email) = LOWER(?) LIMIT 1", [currentSession.userEmail]);
+      if (byEmail && byEmail.length > 0) user = byEmail[0];
+    }
+
+    if (!user) {
+      return res.status(401).json({ error: "User session not recognized. Please sign in again.", code: "USER_NOT_FOUND" });
+    }
+
+    if (user.isActive !== undefined && (user.isActive === 0 || user.isActive === false || String(user.isActive) === "0")) {
+      await revokeAllUserSessions(db, user.id);
       return res.status(403).json({ error: "Your account has been deactivated.", code: "ACCOUNT_DISABLED" });
     }
 

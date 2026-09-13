@@ -186,8 +186,12 @@ export async function refreshAdminToken(): Promise<string | null> {
 
       if (res.status === 401 || res.status === 403) {
         const data = await res.json().catch(() => ({}));
-        console.warn("[AdminAuth] Refresh rejected by server:", data.code || res.status);
-        clearAuthSession();
+        if (data.code === "ACCOUNT_DISABLED" || data.code === "REVOKED" || data.code === "REUSE_DETECTED" || data.code === "INVALID_TOKEN") {
+          console.warn("[AdminAuth] Refresh rejected by server with revocation:", data.code);
+          clearAuthSession();
+          return null;
+        }
+        console.warn(`[AdminAuth] Refresh failed with status ${res.status} (${data.code}); preserving session`);
         return null;
       }
 
@@ -232,8 +236,8 @@ async function request<T>(endpoint: string, options: RequestInit = {}): Promise<
     throw new Error(`NETWORK_ERROR: ${err.message || "Failed to reach server"}`);
   }
 
-  // If 401 and not an auth endpoint, attempt automatic silent refresh and retry
-  if (res.status === 401 && !endpoint.startsWith("/auth/login") && !endpoint.startsWith("/auth/refresh")) {
+  // If 401 or 403 and not an auth endpoint, attempt automatic silent refresh and retry
+  if ((res.status === 401 || res.status === 403) && !endpoint.startsWith("/auth/login") && !endpoint.startsWith("/auth/refresh")) {
     const newToken = await refreshAdminToken();
     if (newToken) {
       headers["Authorization"] = `Bearer ${newToken}`;

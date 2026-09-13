@@ -37,7 +37,7 @@ export function App() {
   const [showGlobalCreateModal, setShowGlobalCreateModal] = useState<boolean>(false);
 
   const setActivePage = (page: PageType) => {
-    if (currentUser?.role === "vendor" && (page === "users" || page === "audit")) {
+    if (currentUser?.role !== "admin" && (page === "users" || page === "audit")) {
       setActivePageState("dashboard");
       window.location.hash = "dashboard";
       return;
@@ -50,7 +50,7 @@ export function App() {
     const onHashChange = () => {
       const page = window.location.hash.replace("#", "").toLowerCase() as PageType;
       if (VALID_PAGES.includes(page)) {
-        if (currentUser?.role === "vendor" && (page === "users" || page === "audit")) {
+        if (currentUser?.role !== "admin" && (page === "users" || page === "audit")) {
           setActivePageState("dashboard");
           window.location.hash = "dashboard";
           return;
@@ -93,7 +93,7 @@ export function App() {
       }
 
       const user = await api.getMe();
-      if (user.role !== "admin" && user.role !== "vendor") {
+      if (user.role !== "admin" && user.role !== "vendor" && user.role !== "user") {
         console.warn("[Auth Bootstrap] Role not authorized for web console:", user.role);
         clearAuthSession();
         setCurrentUser(null);
@@ -122,7 +122,7 @@ export function App() {
         if (refreshedToken) {
           try {
             const user = await api.getMe();
-            if (user.role === "admin" || user.role === "vendor") {
+            if (user.role === "admin" || user.role === "vendor" || user.role === "user") {
               setAuthSession(refreshedToken, getRefreshToken(), user);
               setCurrentUser(user);
               setIsAuthenticated(true);

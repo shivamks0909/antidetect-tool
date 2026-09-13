@@ -63,13 +63,15 @@ export async function validateSession(dbOrToken, ...rest) {
     // this container's local DB (e.g., serverless Lambda cold-start or multi-worker SQLite fallback):
     if (decoded && decoded.id) {
       const now = toMySQLDate();
+      const famId = decoded.familyId || decoded.jti || crypto.randomUUID();
       try {
         const [insertResult] = await db.query(
-          "INSERT INTO active_sessions (userId, userEmail, tokenHash, userAgent, ip, createdAt, lastActiveAt, isRevoked) VALUES (?, ?, ?, ?, ?, ?, ?, 0)",
+          "INSERT INTO active_sessions (userId, userEmail, tokenHash, familyId, userAgent, ip, createdAt, lastActiveAt, isRevoked) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)",
           [
             parseInt(decoded.id, 10),
             decoded.email || "",
             tokenHashed,
+            famId,
             "Serverless Restored Session",
             "127.0.0.1",
             now,
@@ -83,6 +85,7 @@ export async function validateSession(dbOrToken, ...rest) {
             userId: decoded.id,
             userEmail: decoded.email,
             tokenHash: tokenHashed,
+            familyId: famId,
             createdAt: now,
             lastActiveAt: now,
             isRevoked: 0,
@@ -95,13 +98,14 @@ export async function validateSession(dbOrToken, ...rest) {
     return { valid: false, reason: "revoked" };
   }
 
-  const now = Date.now();
-  const createdAt = parseDateMs(session.createdAt);
-  const lastActiveAt = parseDateMs(session.lastActiveAt);
-
-  // Enforce idle & absolute timeouts on standalone/ephemeral web sessions.
-  // Sessions backed by a persistent refresh token family are renewed via silent refresh rotation.
+  // Enforce idle & absolute timeouts ONLY on standalone/ephemeral test sessions that lack a refresh family.
+  // Real authenticated sessions (Browser desktop app, Admin console, auto-healed sessions) have familyId
+  // and remain permanently authenticated across idle, sleep/wake, and app restarts until explicit logout.
   if (!session.refreshTokenHash && !session.familyId) {
+    const now = Date.now();
+    const createdAt = parseDateMs(session.createdAt);
+    const lastActiveAt = parseDateMs(session.lastActiveAt);
+
     if (now - createdAt > SESSION_ABSOLUTE_TIMEOUT_MS) {
       await db.query(
         "UPDATE active_sessions SET isRevoked = 1, revokedAt = ? WHERE id = ?",
@@ -161,8 +165,8 @@ export async function createSessionWithRefresh(dbOrUserId, ...rest) {
 }
 
 /**
- * Rotates a refresh token with RFC 6749 reuse detection.
- * If an already-rotated refresh token is presented, revokes all tokens in the family immediately.
+ * Rotates a refresh token with RFC 6749 reuse detection and 30-second concurrency grace period.
+ * If an already-rotated refresh token is presented after grace window, revokes all tokens in the family immediately.
  */
 export async function rotateRefreshToken(dbOrToken, ...rest) {
   const { db, args } = resolveDB(dbOrToken, ...rest);
@@ -186,15 +190,20 @@ export async function rotateRefreshToken(dbOrToken, ...rest) {
   }
 
   // 2. Reuse Detection: If this refresh token was already rotated,
-  // someone might have intercepted it! Revoke all tokens in this family.
+  // check 30-second grace period for concurrent requests before treating as attack.
   if (session.isRotated || Number(session.isRotated) === 1) {
-    console.warn(`[Security/Session] Refresh token reuse detected for family ${session.familyId}! Revoking family.`);
-    const now = toMySQLDate();
-    await db.query(
-      "UPDATE active_sessions SET isRevoked = 1, revokedAt = ? WHERE familyId = ?",
-      [now, session.familyId]
-    );
-    return { valid: false, reason: "reuse_detected" };
+    const rotatedAt = parseDateMs(session.lastActiveAt);
+    const nowMs = Date.now();
+    const isGrace = rotatedAt && (nowMs - rotatedAt < 30000);
+    if (!isGrace) {
+      console.warn(`[Security/Session] Refresh token reuse detected for family ${session.familyId}! Revoking family.`);
+      const now = toMySQLDate();
+      await db.query(
+        "UPDATE active_sessions SET isRevoked = 1, revokedAt = ? WHERE familyId = ?",
+        [now, session.familyId]
+      );
+      return { valid: false, reason: "reuse_detected" };
+    }
   }
 
   // 3. Mark the current refresh token as rotated

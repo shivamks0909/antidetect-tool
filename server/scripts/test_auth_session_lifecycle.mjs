@@ -95,8 +95,24 @@ async function runTests() {
     rotatedRefreshToken = data.refreshToken;
   });
 
-  await test("5. Replaying old rotated refresh token triggers REUSE DETECTION", async () => {
-    // Attempt to reuse old refreshToken (which was already rotated)
+  await test("5. Replaying rotated token within 30s grace window succeeds (race condition protection)", async () => {
+    // Immediate concurrent retry with old refreshToken should succeed in grace window
+    const res = await fetch(`${BASE_URL}/api/auth/refresh`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ refreshToken }),
+    });
+    assert.strictEqual(res.status, 200, "Must tolerate concurrent refresh in 30s grace window");
+    const data = await res.json();
+    assert.strictEqual(data.success, true);
+  });
+
+  await test("6. Replaying rotated token outside grace window triggers REUSE DETECTION", async () => {
+    // Simulate rotation was 60 seconds ago (outside grace window)
+    const db = getDB();
+    const sixtySecAgo = new Date(Date.now() - 60 * 1000).toISOString().replace("T", " ").replace("Z", "");
+    await db.query("UPDATE active_sessions SET lastActiveAt = ? WHERE isRotated = 1", [sixtySecAgo]);
+
     const res = await fetch(`${BASE_URL}/api/auth/refresh`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -107,8 +123,7 @@ async function runTests() {
     assert.strictEqual(data.code, "REUSE_DETECTED");
   });
 
-  await test("6. Token family revoked after reuse detection", async () => {
-    // Because reuse was detected in step 5, even rotatedRefreshToken should now be revoked
+  await test("6b. Token family revoked after reuse detection", async () => {
     const res = await fetch(`${BASE_URL}/api/auth/refresh`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },

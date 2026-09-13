@@ -80,6 +80,7 @@ async function persistSecureSession(payload: SecureSessionPayload): Promise<void
   const ok = await safeInvoke("auth_save_secure_session", { sessionJson: json });
   if (!ok) {
     try {
+      localStorage.setItem("__oi_secure_sess", json);
       sessionStorage.setItem("__oi_secure_sess", json);
     } catch (_) {}
   }
@@ -100,7 +101,7 @@ async function loadSecureSession(): Promise<SecureSessionPayload | null> {
 
   // Web fallback for development
   try {
-    const webFallback = sessionStorage.getItem("__oi_secure_sess");
+    const webFallback = localStorage.getItem("__oi_secure_sess") || sessionStorage.getItem("__oi_secure_sess");
     if (webFallback) return JSON.parse(webFallback);
   } catch (_) {}
 
@@ -125,6 +126,7 @@ async function wipeSecureSession(): Promise<void> {
   await safeInvoke("auth_clear_secure_session");
   try {
     sessionStorage.removeItem("__oi_secure_sess");
+    localStorage.removeItem("__oi_secure_sess");
   } catch (_) {}
   try {
     localStorage.removeItem("opinion_jwt_token");
@@ -192,17 +194,23 @@ export const refreshAuthSession = async (): Promise<boolean> => {
         }
 
         // True revocation or token reuse detected -> explicit sign-out
-        console.warn("[auth] Refresh token explicitly rejected by server:", data.code || res.status);
-        await wipeSecureSession();
-        await safeInvoke("auth_logout");
-        useAuthStore.setState({
-          user: null,
-          profile: null,
-          token: null,
-          refreshToken: null,
-          status: "signed_out",
-          error: "Session expired. Please sign in again.",
-        });
+        if (data.code === "REVOKED" || data.code === "REUSE_DETECTED" || data.code === "INVALID_TOKEN") {
+          console.warn("[auth] Refresh token explicitly rejected by server:", data.code || res.status);
+          await wipeSecureSession();
+          await safeInvoke("auth_logout");
+          useAuthStore.setState({
+            user: null,
+            profile: null,
+            token: null,
+            refreshToken: null,
+            status: "signed_out",
+            error: "Session expired. Please sign in again.",
+          });
+          return false;
+        }
+
+        // Temporary server errors or unrecognized codes: do NOT clear session!
+        console.warn(`[auth] Refresh endpoint returned ${res.status} (${data.code}); preserving session`);
         return false;
       }
 
@@ -326,7 +334,15 @@ export const useAuthStore = create<AuthState>((set, get) => {
           }
 
           if (res.status === 403) {
-            await handleDeactivation("Your account has been deactivated or access revoked.");
+            const data = await res.json().catch(() => ({}));
+            if (data.code === "ACCOUNT_DISABLED") {
+              await handleDeactivation("Your account has been deactivated. Please contact your administrator.");
+              return;
+            }
+            const refreshed = await refreshAuthSession();
+            if (!refreshed && (get().status === "signed_out" || get().status === "deactivated")) {
+              get().stopHeartbeat();
+            }
             return;
           }
 
@@ -404,7 +420,15 @@ export const useAuthStore = create<AuthState>((set, get) => {
         }
 
         if (res.status === 403) {
-          await handleDeactivation("Your account has been deactivated or session revoked.");
+          const data = await res.json().catch(() => ({}));
+          if (data.code === "ACCOUNT_DISABLED") {
+            await handleDeactivation("Your account has been deactivated. Please contact your administrator.");
+            return;
+          }
+          const refreshed = await refreshAuthSession();
+          if (refreshed) {
+            get().startHeartbeat();
+          }
           return;
         }
 
