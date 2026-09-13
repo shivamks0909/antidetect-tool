@@ -1,11 +1,11 @@
 {
-  "version": "2.0.2",
-  "notes": "Opinion Insights Browser v2.0.2 Release - High-Performance Enterprise Multi-Profile Platform with Complete Tenant Isolation, High-Fidelity Antidetect Engine, Batch XLSX/CSV Provisioning, and Non-Destructive Auto-Updates.",
-  "pub_date": "2026-09-07T21:03:23.142Z",
+  "version": "2.3.0",
+  "notes": "Opinion Insights Browser v2.3.0 — Permanent authentication session persistence, geolocation:// proxy support, and reliability improvements.",
+  "pub_date": "2026-09-14T00:00:00Z",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSS2tIaXRkRFphMC9BdzFBeDFUOWhweFRveWNRRHNTTTgzTHhmMEhEZUltQXF5WFQwalpGVE1yNkVJblp6ZjZWMWRWVlV4NXFNN2dMQXFHUzZ5bk5DSkxGdUZIcGpnRUFBPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg4ODE0OTk1CWZpbGU6T3BpbmlvbiBJbnNpZ2h0cyBCcm93c2VyXzIuMC4yX3g2NC1zZXR1cC5leGUKUEs2WFNNY2JhQkhTandsVlFuTllkVFJ2dUZCK1AzSXluRGJzOTRmSStMQ3ltbTNhL1MxbGNSRWlBb0tWUTJrNzV0OEdpdHZPY1lSMExIVi9hMlluQkE9PQo=",
-      "url": "https://github.com/opinion-insights/antidetect-browser/releases/download/v2.0.2/Opinion.Insights.Browser_2.0.2_x64-setup.exe"
+      "signature": "AAAPQwHTSKzl/Wn9ngBYxYsp6I2dOq+zx0pAEkDCFgVTdEHA4CRDjOW92IyugZ8PY2ke/g+LeVMmc15w9hRZlEz30zTLpX0cwpk9DQ==",
+      "url": "https://github.com/shivamks0909/antidetect-tool/releases/download/v2.3.0/Opinion.Insights.Browser_2.3.0_x64-setup.nsis.zip"
     }
   }
 }
