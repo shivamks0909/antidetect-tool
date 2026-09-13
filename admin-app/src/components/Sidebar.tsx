@@ -7,10 +7,13 @@ interface SidebarProps {
   setActivePage: (page: "dashboard" | "users" | "audit" | "security" | "proxies" | "settings") => void;
   onLogout: () => void;
   currentUserEmail?: string;
+  currentUserRole?: string;
   mongoStatus?: string;
 }
 
-export function Sidebar({ activePage, setActivePage, onLogout, currentUserEmail, mongoStatus }: SidebarProps) {
+export function Sidebar({ activePage, setActivePage, onLogout, currentUserEmail, currentUserRole, mongoStatus }: SidebarProps) {
+  const isAdmin = currentUserRole !== "vendor";
+
   return (
     <aside className="w-64 bg-slate-900 text-slate-300 flex flex-col h-screen border-r border-slate-800 select-none">
       {/* Brand Header */}
@@ -25,7 +28,7 @@ export function Sidebar({ activePage, setActivePage, onLogout, currentUserEmail,
             Opinion <span className="text-green-400 font-bold">insights</span>
           </div>
           <div className="text-[11px] font-semibold text-slate-400 mt-1 uppercase tracking-wider">
-            Admin Console
+            {currentUserRole === "vendor" ? "Vendor Portal" : "Admin Console"}
           </div>
         </div>
       </div>
@@ -53,17 +56,19 @@ export function Sidebar({ activePage, setActivePage, onLogout, currentUserEmail,
           Dashboard
         </button>
 
-        <button
-          onClick={() => setActivePage("users")}
-          className={`w-full flex items-center gap-3 px-3.5 py-2.5 rounded-xl font-semibold text-sm transition-all ${
-            activePage === "users"
-              ? "bg-green-600 text-white shadow-lg shadow-green-600/20"
-              : "text-slate-400 hover:text-slate-100 hover:bg-slate-800/50"
-          }`}
-        >
-          <Users className="w-4 h-4" />
-          User Management
-        </button>
+        {isAdmin && (
+          <button
+            onClick={() => setActivePage("users")}
+            className={`w-full flex items-center gap-3 px-3.5 py-2.5 rounded-xl font-semibold text-sm transition-all ${
+              activePage === "users"
+                ? "bg-green-600 text-white shadow-lg shadow-green-600/20"
+                : "text-slate-400 hover:text-slate-100 hover:bg-slate-800/50"
+            }`}
+          >
+            <Users className="w-4 h-4" />
+            User Management
+          </button>
+        )}
 
         <button
           onClick={() => setActivePage("security")}
@@ -89,17 +94,19 @@ export function Sidebar({ activePage, setActivePage, onLogout, currentUserEmail,
           Proxy Monitor
         </button>
 
-        <button
-          onClick={() => setActivePage("audit")}
-          className={`w-full flex items-center gap-3 px-3.5 py-2.5 rounded-xl font-semibold text-sm transition-all ${
-            activePage === "audit"
-              ? "bg-green-600 text-white shadow-lg shadow-green-600/20"
-              : "text-slate-400 hover:text-slate-100 hover:bg-slate-800/50"
-          }`}
-        >
-          <ShieldAlert className="w-4 h-4" />
-          Audit Logs
-        </button>
+        {isAdmin && (
+          <button
+            onClick={() => setActivePage("audit")}
+            className={`w-full flex items-center gap-3 px-3.5 py-2.5 rounded-xl font-semibold text-sm transition-all ${
+              activePage === "audit"
+                ? "bg-green-600 text-white shadow-lg shadow-green-600/20"
+                : "text-slate-400 hover:text-slate-100 hover:bg-slate-800/50"
+            }`}
+          >
+            <ShieldAlert className="w-4 h-4" />
+            Audit Logs
+          </button>
+        )}
 
         <button
           onClick={() => setActivePage("settings")}
@@ -118,14 +125,13 @@ export function Sidebar({ activePage, setActivePage, onLogout, currentUserEmail,
       <div className="p-4 border-t border-slate-800 bg-slate-950/40">
         <div className="flex items-center justify-between">
           <div className="min-w-0 pr-2">
-            <div className="text-xs font-bold text-slate-200 truncate">{currentUserEmail || "Admin User"}</div>
-            <div className="text-[10px] text-green-400 font-semibold uppercase">Administrator</div>
+            <div className="text-xs font-bold text-slate-200 truncate">{currentUserEmail || "User"}</div>
+            <div className="text-[10px] text-green-400 font-semibold uppercase">
+              {currentUserRole === "vendor" ? "Vendor Partner" : "Administrator"}
+            </div>
           </div>
           <button
-            onClick={() => {
-              setAuthToken(null);
-              onLogout();
-            }}
+            onClick={onLogout}
             className="p-2 text-slate-400 hover:text-red-400 hover:bg-slate-800 rounded-lg transition-colors"
             title="Log Out"
           >

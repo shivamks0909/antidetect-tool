@@ -522,6 +522,10 @@ export function requireAdmin(req, res, next) {
   return requireRole("admin")(req, res, next);
 }
 
+export function requireStaff(req, res, next) {
+  return requireRole(["admin", "vendor"])(req, res, next);
+}
+
 // Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Health Check Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 // ─── Health Check & Auto-Fix Endpoints ───
 const healthHandler = async (req, res) => {
@@ -1548,7 +1552,7 @@ app.get("/api/admin/audit-logs", authenticateToken, requireAdmin, async (req, re
 
 // ─── Admin Proxy Monitor Endpoints ───
 
-app.get("/api/admin/proxy-monitor/stats", authenticateToken, requireAdmin, async (req, res) => {
+app.get("/api/admin/proxy-monitor/stats", authenticateToken, requireStaff, async (req, res) => {
   try {
     const db = getDB();
     const [[totalRow]] = await db.query("SELECT COUNT(*) as cnt FROM profile_proxies");
@@ -1571,7 +1575,7 @@ app.get("/api/admin/proxy-monitor/stats", authenticateToken, requireAdmin, async
   }
 });
 
-app.get("/api/admin/proxy-monitor", authenticateToken, requireAdmin, async (req, res) => {
+app.get("/api/admin/proxy-monitor", authenticateToken, requireStaff, async (req, res) => {
   try {
     const db = getDB();
     const page = Math.max(1, parseInt(req.query.page || "1", 10));
@@ -1704,7 +1708,7 @@ app.get("/api/admin/proxy-monitor", authenticateToken, requireAdmin, async (req,
   }
 });
 
-app.get("/api/admin/proxy-monitor/:id/timeline", authenticateToken, requireAdmin, async (req, res) => {
+app.get("/api/admin/proxy-monitor/:id/timeline", authenticateToken, requireStaff, async (req, res) => {
   try {
     const db = getDB();
     const proxyId = req.params.id;

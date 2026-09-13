@@ -136,7 +136,6 @@ async function runTests() {
 
   await test("8. Persistent session not revoked on idle (Simulated 8-hour idle)", async () => {
     const db = getDB();
-    // Simulate session idle by setting lastActiveAt to 8 hours ago
     const eightHoursAgo = new Date(Date.now() - 8 * 60 * 60 * 1000).toISOString().replace("T", " ").replace("Z", "");
     await db.query(
       "UPDATE active_sessions SET lastActiveAt = ? WHERE userEmail = ?",
@@ -156,7 +155,86 @@ async function runTests() {
     freshRefresh = data.refreshToken;
   });
 
-  await test("9. Explicit logout permanently invalidates session family", async () => {
+  let vendorAccess = "";
+  let vendorRefresh = "";
+
+  await test("9. Vendor login establishes persistent session with vendor role", async () => {
+    const res = await fetch(`${BASE_URL}/api/auth/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email: "vendor@opinioninsights.in", password: "Delle6400@" }),
+    });
+    assert.strictEqual(res.status, 200);
+    const data = await res.json();
+    assert.strictEqual(data.success, true);
+    assert.strictEqual(data.user.role, "vendor");
+    assert.ok(data.token);
+    assert.ok(data.refreshToken);
+    vendorAccess = data.token;
+    vendorRefresh = data.refreshToken;
+  });
+
+  await test("10. Vendor can access proxy monitor stats and fleet via requireStaff", async () => {
+    const statsRes = await fetch(`${BASE_URL}/api/admin/proxy-monitor/stats`, {
+      headers: { Authorization: `Bearer ${vendorAccess}` },
+    });
+    assert.strictEqual(statsRes.status, 200, "Vendor must be allowed on proxy monitor stats");
+
+    const listRes = await fetch(`${BASE_URL}/api/admin/proxy-monitor`, {
+      headers: { Authorization: `Bearer ${vendorAccess}` },
+    });
+    assert.strictEqual(listRes.status, 200, "Vendor must be allowed on proxy monitor list");
+  });
+
+  await test("11. Vendor is denied access to admin-only user management (RBAC preserved)", async () => {
+    const usersRes = await fetch(`${BASE_URL}/api/admin/users`, {
+      headers: { Authorization: `Bearer ${vendorAccess}` },
+    });
+    assert.strictEqual(usersRes.status, 403, "Vendor must be rejected from user management");
+  });
+
+  await test("12. Vendor persistent session survives overnight idle (24 hours)", async () => {
+    const db = getDB();
+    const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().replace("T", " ").replace("Z", "");
+    await db.query(
+      "UPDATE active_sessions SET lastActiveAt = ?, createdAt = ? WHERE userEmail = ?",
+      [yesterday, yesterday, "vendor@opinioninsights.in"]
+    );
+
+    const res = await fetch(`${BASE_URL}/api/auth/refresh`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ refreshToken: vendorRefresh }),
+    });
+    assert.strictEqual(res.status, 200, "Vendor session must not expire after overnight idle");
+    const data = await res.json();
+    assert.strictEqual(data.success, true);
+    assert.strictEqual(data.user.role, "vendor");
+    vendorAccess = data.token;
+    vendorRefresh = data.refreshToken;
+  });
+
+  await test("13. Account deactivation immediately revokes session on next refresh", async () => {
+    const db = getDB();
+    // Temporarily deactivate vendor account
+    await db.query("UPDATE users SET isActive = 0 WHERE email = ?", ["vendor@opinioninsights.in"]);
+
+    try {
+      const res = await fetch(`${BASE_URL}/api/auth/refresh`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ refreshToken: vendorRefresh }),
+      });
+      assert.strictEqual(res.status, 403);
+      const data = await res.json();
+      assert.strictEqual(data.code, "ACCOUNT_DISABLED");
+    } finally {
+      // Re-enable vendor account
+      await db.query("UPDATE users SET isActive = 1 WHERE email = ?", ["vendor@opinioninsights.in"]);
+    }
+  });
+
+  await test("14. Explicit logout permanently invalidates session family", async () => {
     const res = await fetch(`${BASE_URL}/api/auth/logout`, {
       method: "POST",
       headers: {

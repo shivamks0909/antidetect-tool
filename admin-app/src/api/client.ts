@@ -105,20 +105,113 @@ export interface ActiveSessionItem {
   isCurrent: boolean;
 }
 
+const TOKEN_KEY = "opinion_admin_token";
+const REFRESH_TOKEN_KEY = "opinion_admin_refresh_token";
+const USER_KEY = "opinion_admin_user";
+
 export function getAuthToken(): string | null {
-  return localStorage.getItem("opinion_admin_token");
+  return localStorage.getItem(TOKEN_KEY);
+}
+
+export function getRefreshToken(): string | null {
+  return localStorage.getItem(REFRESH_TOKEN_KEY);
+}
+
+export function getCachedUser(): UserItem | null {
+  try {
+    const raw = localStorage.getItem(USER_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
 }
 
 export function setAuthToken(token: string | null): void {
   if (token) {
-    localStorage.setItem("opinion_admin_token", token);
+    localStorage.setItem(TOKEN_KEY, token);
   } else {
-    localStorage.removeItem("opinion_admin_token");
+    localStorage.removeItem(TOKEN_KEY);
   }
 }
 
+export function setAuthSession(token: string | null, refreshToken?: string | null, user?: UserItem | null): void {
+  if (token) {
+    localStorage.setItem(TOKEN_KEY, token);
+  } else {
+    localStorage.removeItem(TOKEN_KEY);
+  }
+
+  if (refreshToken !== undefined) {
+    if (refreshToken) {
+      localStorage.setItem(REFRESH_TOKEN_KEY, refreshToken);
+    } else {
+      localStorage.removeItem(REFRESH_TOKEN_KEY);
+    }
+  }
+
+  if (user !== undefined) {
+    if (user) {
+      localStorage.setItem(USER_KEY, JSON.stringify(user));
+    } else {
+      localStorage.removeItem(USER_KEY);
+    }
+  }
+}
+
+export function clearAuthSession(): void {
+  localStorage.removeItem(TOKEN_KEY);
+  localStorage.removeItem(REFRESH_TOKEN_KEY);
+  localStorage.removeItem(USER_KEY);
+}
+
+let activeRefreshPromise: Promise<string | null> | null = null;
+
+export async function refreshAdminToken(): Promise<string | null> {
+  if (activeRefreshPromise) {
+    return activeRefreshPromise;
+  }
+
+  activeRefreshPromise = (async () => {
+    const currentRefreshToken = getRefreshToken();
+    if (!currentRefreshToken) {
+      return null;
+    }
+
+    try {
+      const res = await fetch(`${API_BASE}/auth/refresh`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ refreshToken: currentRefreshToken }),
+      });
+
+      if (res.status === 401 || res.status === 403) {
+        const data = await res.json().catch(() => ({}));
+        console.warn("[AdminAuth] Refresh rejected by server:", data.code || res.status);
+        clearAuthSession();
+        return null;
+      }
+
+      if (res.ok) {
+        const data = await res.json();
+        setAuthSession(data.token, data.refreshToken, data.user);
+        return data.token as string;
+      }
+
+      console.warn(`[AdminAuth] Refresh failed with status ${res.status}; preserving session`);
+      return null;
+    } catch (netErr) {
+      console.warn("[AdminAuth] Network error during token refresh; preserving session:", netErr);
+      return null;
+    } finally {
+      activeRefreshPromise = null;
+    }
+  })();
+
+  return activeRefreshPromise;
+}
+
 async function request<T>(endpoint: string, options: RequestInit = {}): Promise<T> {
-  const token = getAuthToken();
+  let token = getAuthToken();
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
     ...(options.headers as Record<string, string>),
@@ -128,15 +221,40 @@ async function request<T>(endpoint: string, options: RequestInit = {}): Promise<
     headers["Authorization"] = `Bearer ${token}`;
   }
 
-  const res = await fetch(`${API_BASE}${endpoint}`, {
-    ...options,
-    credentials: "include",
-    headers,
-  });
+  let res: Response;
+  try {
+    res = await fetch(`${API_BASE}${endpoint}`, {
+      ...options,
+      credentials: "include",
+      headers,
+    });
+  } catch (err: any) {
+    throw new Error(`NETWORK_ERROR: ${err.message || "Failed to reach server"}`);
+  }
+
+  // If 401 and not an auth endpoint, attempt automatic silent refresh and retry
+  if (res.status === 401 && !endpoint.startsWith("/auth/login") && !endpoint.startsWith("/auth/refresh")) {
+    const newToken = await refreshAdminToken();
+    if (newToken) {
+      headers["Authorization"] = `Bearer ${newToken}`;
+      try {
+        res = await fetch(`${API_BASE}${endpoint}`, {
+          ...options,
+          credentials: "include",
+          headers,
+        });
+      } catch (err: any) {
+        throw new Error(`NETWORK_ERROR: ${err.message || "Failed to reach server on retry"}`);
+      }
+    }
+  }
 
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
-    throw new Error((data as any).error || `HTTP ${res.status}: ${res.statusText}`);
+    const err: any = new Error((data as any).error || `HTTP ${res.status}: ${res.statusText}`);
+    err.status = res.status;
+    err.code = (data as any).code;
+    throw err;
   }
 
   return data as T;
@@ -147,6 +265,7 @@ export const api = {
     const data = await request<{
       success: boolean;
       token?: string;
+      refreshToken?: string;
       user?: UserItem;
       require2FA?: boolean;
       tempToken?: string;
@@ -156,7 +275,7 @@ export const api = {
       body: JSON.stringify({ email: email.trim(), password }),
     });
     if (data.token) {
-      setAuthToken(data.token);
+      setAuthSession(data.token, data.refreshToken, data.user);
     }
     return data;
   },
@@ -171,12 +290,13 @@ export const api = {
     const data = await request<{
       success: boolean;
       token: string;
+      refreshToken?: string;
       user: UserItem;
     }>("/auth/login/2fa", {
       method: "POST",
       body: JSON.stringify({ tempToken, code }),
     });
-    setAuthToken(data.token);
+    setAuthSession(data.token, data.refreshToken, data.user);
     return data;
   },
 
@@ -252,11 +372,17 @@ export const api = {
     return request<UserItem>("/auth/me");
   },
 
+  refreshToken: refreshAdminToken,
+
   logout: async () => {
+    const refreshToken = getRefreshToken();
     try {
-      await request("/auth/logout", { method: "POST" });
+      await request("/auth/logout", {
+        method: "POST",
+        body: JSON.stringify({ refreshToken }),
+      });
     } catch (_) {}
-    setAuthToken(null);
+    clearAuthSession();
   },
 
   getHealth: async () => {

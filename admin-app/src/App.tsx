@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from "react";
-import { api, UserItem, AuditLogItem, HealthStatus, getAuthToken } from "./api/client";
+import { api, UserItem, AuditLogItem, HealthStatus, getAuthToken, getRefreshToken, getCachedUser, setAuthSession, clearAuthSession } from "./api/client";
 import { Sidebar } from "./components/Sidebar";
 import { Header } from "./components/Header";
 import { Login } from "./pages/Login";
@@ -37,6 +37,11 @@ export function App() {
   const [showGlobalCreateModal, setShowGlobalCreateModal] = useState<boolean>(false);
 
   const setActivePage = (page: PageType) => {
+    if (currentUser?.role === "vendor" && (page === "users" || page === "audit")) {
+      setActivePageState("dashboard");
+      window.location.hash = "dashboard";
+      return;
+    }
     setActivePageState(page);
     window.location.hash = page;
   };
@@ -45,50 +50,92 @@ export function App() {
     const onHashChange = () => {
       const page = window.location.hash.replace("#", "").toLowerCase() as PageType;
       if (VALID_PAGES.includes(page)) {
+        if (currentUser?.role === "vendor" && (page === "users" || page === "audit")) {
+          setActivePageState("dashboard");
+          window.location.hash = "dashboard";
+          return;
+        }
         setActivePageState(page);
       }
     };
     window.addEventListener("hashchange", onHashChange);
     return () => window.removeEventListener("hashchange", onHashChange);
-  }, []);
+  }, [currentUser]);
 
   const checkAuth = async (isRetry = false) => {
-    const token = getAuthToken();
-    if (!token) {
+    let token = getAuthToken();
+    const refreshToken = getRefreshToken();
+
+    if (!token && !refreshToken) {
       setIsAuthenticated(false);
+      setCurrentUser(null);
       setLoading(false);
       return;
     }
 
+    // Pre-populate user from cache if available so UI doesn't flicker
+    const cachedUser = getCachedUser();
+    if (cachedUser) {
+      setCurrentUser(cachedUser);
+      setIsAuthenticated(true);
+    }
+
     try {
+      // If access token is absent but refresh token exists, attempt refresh first
+      if (!token && refreshToken) {
+        token = await api.refreshToken();
+        if (!token) {
+          setIsAuthenticated(false);
+          setCurrentUser(null);
+          setLoading(false);
+          return;
+        }
+      }
+
       const user = await api.getMe();
-      if (user.role !== "admin") {
-        api.logout();
+      if (user.role !== "admin" && user.role !== "vendor") {
+        console.warn("[Auth Bootstrap] Role not authorized for web console:", user.role);
+        clearAuthSession();
         setCurrentUser(null);
         setIsAuthenticated(false);
         setLoading(false);
         return;
       }
+      setAuthSession(token, refreshToken, user);
       setCurrentUser(user);
       setIsAuthenticated(true);
     } catch (err: any) {
       console.warn("[Auth Bootstrap] Validation check failed:", err.message);
-      const isExplicitAuthFailure =
-        err.message &&
-        (err.message.includes("401") ||
-          err.message.includes("403") ||
-          err.message.includes("expired") ||
-          err.message.includes("revoked"));
 
-      if (isExplicitAuthFailure) {
-        api.logout();
+      if (err.message && err.message.startsWith("NETWORK_ERROR")) {
+        // Network offline or server cold start: NEVER log out!
+        if (cachedUser || token) {
+          setIsAuthenticated(true);
+        }
+        setLoading(false);
+        return;
+      }
+
+      // If token expired, try silent refresh once
+      if (refreshToken) {
+        const refreshedToken = await api.refreshToken();
+        if (refreshedToken) {
+          try {
+            const user = await api.getMe();
+            if (user.role === "admin" || user.role === "vendor") {
+              setAuthSession(refreshedToken, getRefreshToken(), user);
+              setCurrentUser(user);
+              setIsAuthenticated(true);
+              setLoading(false);
+              return;
+            }
+          } catch (_) {}
+        }
+      }
+
+      // True invalidation (refresh token rejected and wiped)
+      if (!getRefreshToken()) {
         setCurrentUser(null);
-        setIsAuthenticated(false);
-      } else if (!isRetry) {
-        // Cold-start / serverless retry
-        await new Promise((r) => setTimeout(r, 600));
-        return checkAuth(true);
-      } else {
         setIsAuthenticated(false);
       }
     } finally {
@@ -112,16 +159,20 @@ export function App() {
 
   const refreshData = async () => {
     if (!isAuthenticated) return;
-    fetchUsers();
+    if (currentUser?.role === "admin") {
+      fetchUsers();
+      try {
+        const aData = await api.getAuditLogs().catch(() => ({ logs: [] }));
+        setAuditLogs(aData.logs || []);
+      } catch (err) {
+        console.error("Failed to refresh admin audit data:", err);
+      }
+    }
     try {
-      const [aData, hData] = await Promise.all([
-        api.getAuditLogs().catch(() => ({ logs: [] })),
-        api.getHealth(),
-      ]);
-      setAuditLogs(aData.logs || []);
+      const hData = await api.getHealth();
       setHealth(hData);
     } catch (err) {
-      console.error("Failed to refresh admin data:", err);
+      console.error("Failed to refresh health data:", err);
     }
   };
 
@@ -143,6 +194,19 @@ export function App() {
     if (isAuthenticated) {
       refreshData();
     }
+  }, [isAuthenticated, currentUser?.role]);
+
+  // Silent refresh keepalive: periodically renews access token every 5 minutes
+  useEffect(() => {
+    if (!isAuthenticated) return;
+    const interval = setInterval(async () => {
+      try {
+        await api.refreshToken();
+      } catch (err) {
+        console.warn("[AdminAuth] Periodic refresh keepalive notice:", err);
+      }
+    }, 5 * 60 * 1000);
+    return () => clearInterval(interval);
   }, [isAuthenticated]);
 
   if (loading) {
@@ -177,6 +241,7 @@ export function App() {
         setActivePage={setActivePage}
         onLogout={handleLogout}
         currentUserEmail={currentUser?.email}
+        currentUserRole={currentUser?.role}
         mongoStatus={health?.mongodb}
       />
 
