@@ -6,6 +6,7 @@ import os from "os";
 import { fileURLToPath } from "url";
 import { DatabaseSync } from "node:sqlite";
 import bcrypt from "bcryptjs";
+import { hashPassword, hashPasswordSync, verifyPassword } from "./security/crypto.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -187,6 +188,52 @@ CREATE TABLE IF NOT EXISTS quarantined_records (
   quarantinedAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
   reason TEXT
 );
+
+CREATE TABLE IF NOT EXISTS profile_proxies (
+  id VARCHAR(255) PRIMARY KEY,
+  account_id VARCHAR(255) NOT NULL,
+  user_id VARCHAR(255) NOT NULL,
+  profile_id VARCHAR(255) DEFAULT NULL,
+  raw_input TEXT NOT NULL,
+  protocol VARCHAR(20) NOT NULL DEFAULT 'http',
+  host VARCHAR(255) NOT NULL,
+  port INT NOT NULL,
+  username VARCHAR(255) DEFAULT NULL,
+  password_encrypted TEXT DEFAULT NULL,
+  source VARCHAR(50) NOT NULL DEFAULT 'manual',
+  source_file VARCHAR(255) DEFAULT NULL,
+  source_row INT DEFAULT NULL,
+  configuration_status VARCHAR(50) NOT NULL DEFAULT 'CONFIGURED',
+  runtime_status VARCHAR(50) NOT NULL DEFAULT 'IDLE',
+  last_connection_status VARCHAR(50) NOT NULL DEFAULT 'NONE',
+  last_used_at DATETIME DEFAULT NULL,
+  last_connection_at DATETIME DEFAULT NULL,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  INDEX idx_proxy_account (account_id),
+  INDEX idx_proxy_user (user_id),
+  INDEX idx_proxy_profile (profile_id),
+  INDEX idx_proxy_runtime (runtime_status),
+  INDEX idx_proxy_conn (last_connection_status)
+);
+
+CREATE TABLE IF NOT EXISTS proxy_audit_events (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  account_id VARCHAR(255) NOT NULL,
+  user_id VARCHAR(255) NOT NULL,
+  profile_id VARCHAR(255) DEFAULT NULL,
+  proxy_id VARCHAR(255) NOT NULL,
+  event_type VARCHAR(100) NOT NULL,
+  source VARCHAR(50) NOT NULL DEFAULT 'system',
+  status VARCHAR(50) DEFAULT NULL,
+  metadata JSON DEFAULT NULL,
+  ip_address VARCHAR(50) DEFAULT NULL,
+  user_agent VARCHAR(500) DEFAULT NULL,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  INDEX idx_audit_proxy (proxy_id),
+  INDEX idx_audit_event (event_type),
+  INDEX idx_audit_time (created_at)
+);
 `;
 
 // ─── SQLite Schema ───
@@ -316,6 +363,44 @@ CREATE TABLE IF NOT EXISTS quarantined_records (
   quarantinedAt TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   reason TEXT
 );
+
+CREATE TABLE IF NOT EXISTS profile_proxies (
+  id TEXT PRIMARY KEY,
+  account_id TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  profile_id TEXT DEFAULT NULL,
+  raw_input TEXT NOT NULL,
+  protocol TEXT NOT NULL DEFAULT 'http',
+  host TEXT NOT NULL,
+  port INTEGER NOT NULL,
+  username TEXT DEFAULT NULL,
+  password_encrypted TEXT DEFAULT NULL,
+  source TEXT NOT NULL DEFAULT 'manual',
+  source_file TEXT DEFAULT NULL,
+  source_row INTEGER DEFAULT NULL,
+  configuration_status TEXT NOT NULL DEFAULT 'CONFIGURED',
+  runtime_status TEXT NOT NULL DEFAULT 'IDLE',
+  last_connection_status TEXT NOT NULL DEFAULT 'NONE',
+  last_used_at TEXT DEFAULT NULL,
+  last_connection_at TEXT DEFAULT NULL,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS proxy_audit_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  account_id TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  profile_id TEXT DEFAULT NULL,
+  proxy_id TEXT NOT NULL,
+  event_type TEXT NOT NULL,
+  source TEXT NOT NULL DEFAULT 'system',
+  status TEXT DEFAULT NULL,
+  metadata TEXT DEFAULT NULL,
+  ip_address TEXT DEFAULT NULL,
+  user_agent TEXT DEFAULT NULL,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
 `;
 
 // ─── SQL Translator for SQLite Compatibility ───
@@ -327,9 +412,17 @@ function translateSqlForSqlite(sql) {
   // Translate ON DUPLICATE KEY UPDATE
   if (/ON DUPLICATE KEY UPDATE/i.test(s)) {
     if (/system_config/i.test(s)) {
-      s = s.replace(/ON DUPLICATE KEY UPDATE.*/i, "ON CONFLICT(configKey) DO UPDATE SET manifest = excluded.manifest, updatedAt = excluded.updatedAt, publishedBy = excluded.publishedBy");
+      s = s.replace(/ON DUPLICATE KEY UPDATE[\s\S]*/i, "ON CONFLICT(configKey) DO UPDATE SET manifest = excluded.manifest, updatedAt = excluded.updatedAt, publishedBy = excluded.publishedBy");
+    } else if (/profile_proxies/i.test(s)) {
+      s = s.replace(/ON DUPLICATE KEY UPDATE[\s\S]*/i, "ON CONFLICT(id) DO UPDATE SET profile_id = excluded.profile_id, raw_input = excluded.raw_input, protocol = excluded.protocol, host = excluded.host, port = excluded.port, username = excluded.username, password_encrypted = excluded.password_encrypted, source = excluded.source, source_file = excluded.source_file, source_row = excluded.source_row, configuration_status = excluded.configuration_status, runtime_status = excluded.runtime_status, last_connection_status = excluded.last_connection_status, last_used_at = excluded.last_used_at, last_connection_at = excluded.last_connection_at, updated_at = excluded.updated_at");
     } else {
-      s = s.replace(/ON DUPLICATE KEY UPDATE.*/i, "ON CONFLICT(id) DO UPDATE SET document = excluded.document, owner_account_id = excluded.owner_account_id, userId = excluded.userId");
+      const match = s.match(/ON DUPLICATE KEY UPDATE\s+([\s\S]+)$/i);
+      if (match) {
+        const updateClause = match[1].replace(/VALUES\s*\(([^)]+)\)/gi, "excluded.$1");
+        s = s.replace(/ON DUPLICATE KEY UPDATE[\s\S]*/i, `ON CONFLICT(id) DO UPDATE SET ${updateClause}`);
+      } else {
+        s = s.replace(/ON DUPLICATE KEY UPDATE[\s\S]*/i, "ON CONFLICT(id) DO NOTHING");
+      }
     }
   }
   return s;
@@ -363,8 +456,7 @@ function initSqlite() {
   try {
     const userCount = sqliteDb.prepare("SELECT COUNT(*) as cnt FROM users").all()[0]?.cnt || 0;
     if (userCount === 0) {
-      const salt = bcrypt.genSaltSync(10);
-      const passwordHash = bcrypt.hashSync("Delle6400@", salt);
+      const passwordHash = hashPasswordSync("Delle6400@");
       const insert = sqliteDb.prepare(
         "INSERT INTO users (email, passwordHash, fullName, role, isActive, twoFactorEnabled, failedAttempts) VALUES (?, ?, ?, ?, 1, 0, 0)"
       );
@@ -536,8 +628,7 @@ async function autoFixDatabase() {
     ];
 
     const passwordPlain = "Delle6400@";
-    const salt = await bcrypt.genSalt(10);
-    const passwordHash = await bcrypt.hash(passwordPlain, salt);
+    const passwordHash = await hashPassword(passwordPlain);
 
     for (const email of adminAccounts) {
       const [rows] = await db.query("SELECT id, failedAttempts, lockoutUntil FROM users WHERE email = ?", [email]);
@@ -576,7 +667,7 @@ async function autoFixDatabase() {
 
     // 4. Verify password hashing works
     const [verifyRows] = await db.query("SELECT passwordHash FROM users WHERE email = ?", ["admin@opinioninsights.in"]);
-    const isPwValid = await bcrypt.compare(passwordPlain, verifyRows[0].passwordHash);
+    const isPwValid = await verifyPassword(passwordPlain, verifyRows[0].passwordHash);
     report.verified = isPwValid;
     report.actions.push(`Admin credential authentication verified: ${isPwValid ? "OK" : "FAILED"}`);
 

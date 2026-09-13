@@ -1,10 +1,17 @@
-const API_BASE = (import.meta.env.VITE_API_BASE as string) || "https://api.opinioninsights.in/api";
+function resolveApiBase(): string {
+  if (typeof window !== "undefined" && (window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1")) {
+    return "http://127.0.0.1:5000/api";
+  }
+  return (import.meta.env.VITE_API_BASE as string) || "https://api.opinioninsights.in/api";
+}
+
+const API_BASE = resolveApiBase();
 
 export interface UserItem {
   id: string;
   email: string;
   fullName: string;
-  role: "admin" | "user";
+  role: "admin" | "vendor" | "user";
   isActive: boolean;
   createdAt: string;
   profilesCount?: number;
@@ -26,6 +33,75 @@ export interface HealthStatus {
   service: string;
   mongodb: string;
   timestamp: string;
+}
+
+export interface ProxyMonitorStats {
+  total_proxies: number;
+  configured_count: number;
+  running_count: number;
+  failed_count: number;
+  profiles_using_count: number;
+  users_using_count: number;
+}
+
+export interface ProxyMonitorItem {
+  id: string;
+  account_id: string;
+  user_id: string;
+  profile_id: string | null;
+  user_email: string;
+  user_name: string;
+  raw_input: string;
+  protocol: string;
+  host: string;
+  port: number;
+  username: string | null;
+  password_masked: string | null;
+  has_password: boolean;
+  source: string;
+  source_file: string | null;
+  source_row: number | null;
+  configuration_status: "CONFIGURED" | "UNASSIGNED";
+  runtime_status: "RUNNING" | "STOPPED" | "IDLE";
+  last_connection_status: "SUCCESS" | "FAILED" | "PENDING" | "NONE";
+  last_used_at: string | null;
+  last_connection_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ProxyAuditEventItem {
+  id: number;
+  account_id: string;
+  user_id: string;
+  profile_id: string | null;
+  proxy_id: string;
+  event_type: string;
+  source: string;
+  status: string | null;
+  metadata: Record<string, any>;
+  ip_address: string | null;
+  user_agent: string | null;
+  created_at: string;
+}
+
+export interface ProxyMonitorListResponse {
+  items: ProxyMonitorItem[];
+  pagination: {
+    total: number;
+    page: number;
+    limit: number;
+    pages: number;
+  };
+}
+
+export interface ActiveSessionItem {
+  id: string;
+  userAgent: string;
+  ip: string;
+  createdAt: string;
+  lastActiveAt: string;
+  isCurrent: boolean;
 }
 
 export function getAuthToken(): string | null {
@@ -53,12 +129,13 @@ async function request<T>(endpoint: string, options: RequestInit = {}): Promise<
 
   const res = await fetch(`${API_BASE}${endpoint}`, {
     ...options,
+    credentials: "include",
     headers,
   });
 
-  const data = await res.json();
+  const data = await res.json().catch(() => ({}));
   if (!res.ok) {
-    throw new Error(data.error || `HTTP ${res.status}: ${res.statusText}`);
+    throw new Error((data as any).error || `HTTP ${res.status}: ${res.statusText}`);
   }
 
   return data as T;
@@ -157,8 +234,9 @@ export const api = {
   },
 
   revokeSessionById: async (sessionId: string) => {
-    return request<{ success: boolean; message: string }>(`/admin/sessions/${sessionId}/revoke`, {
-      method: "DELETE",
+    return request<{ success: boolean; message: string }>("/admin/sessions/revoke", {
+      method: "POST",
+      body: JSON.stringify({ sessionId }),
     });
   },
 
@@ -173,6 +251,13 @@ export const api = {
     return request<UserItem>("/auth/me");
   },
 
+  logout: async () => {
+    try {
+      await request("/auth/logout", { method: "POST" });
+    } catch (_) {}
+    setAuthToken(null);
+  },
+
   getHealth: async () => {
     try {
       const res = await fetch(`${API_BASE}/health`);
@@ -182,8 +267,17 @@ export const api = {
     }
   },
 
-  getUsers: async () => {
-    return request<{ users: UserItem[] }>("/admin/users");
+  getUsers: async (params: { role?: string; status?: string; search?: string; page?: number; limit?: number } = {}) => {
+    const query = new URLSearchParams();
+    if (params.role && params.role !== "all") query.set("role", params.role);
+    if (params.status && params.status !== "all") query.set("status", params.status);
+    if (params.search) query.set("search", params.search);
+    if (params.page) query.set("page", String(params.page));
+    if (params.limit) query.set("limit", String(params.limit));
+    const qs = query.toString();
+    return request<{ users: UserItem[]; pagination?: { total: number; page: number; limit: number; pages: number } }>(
+      `/admin/users${qs ? `?${qs}` : ""}`
+    );
   },
 
   createUser: async (userData: { email: string; password: string; fullName?: string; role: string }) => {
@@ -208,6 +302,75 @@ export const api = {
 
   getAuditLogs: async () => {
     return request<{ logs: AuditLogItem[] }>("/admin/audit-logs");
+  },
+
+  getProxyMonitorStats: async () => {
+    return request<ProxyMonitorStats>("/admin/proxy-monitor/stats");
+  },
+
+  getProxyMonitorList: async (params: {
+    page?: number;
+    limit?: number;
+    search?: string;
+    protocol?: string;
+    configuration_status?: string;
+    runtime_status?: string;
+    last_connection_status?: string;
+    source?: string;
+  } = {}) => {
+    const query = new URLSearchParams();
+    if (params.page) query.set("page", String(params.page));
+    if (params.limit) query.set("limit", String(params.limit));
+    if (params.search) query.set("search", params.search);
+    if (params.protocol) query.set("protocol", params.protocol);
+    if (params.configuration_status) query.set("configuration_status", params.configuration_status);
+    if (params.runtime_status) query.set("runtime_status", params.runtime_status);
+    if (params.last_connection_status) query.set("last_connection_status", params.last_connection_status);
+    if (params.source) query.set("source", params.source);
+
+    const qs = query.toString();
+    return request<ProxyMonitorListResponse>(`/admin/proxy-monitor${qs ? `?${qs}` : ""}`);
+  },
+
+  getProxyTimeline: async (proxyId: string) => {
+    return request<{ events: ProxyAuditEventItem[] }>(`/admin/proxy-monitor/${proxyId}/timeline`);
+  },
+
+  revealProxyCredential: async (proxyId: string, payload?: { password?: string; reauthToken?: string }) => {
+    return request<{
+      success: boolean;
+      id: string;
+      raw_input: string;
+      username: string | null;
+      password: string | null;
+    }>(`/admin/proxy-monitor/${proxyId}/reveal-credential`, {
+      method: "POST",
+      body: payload ? JSON.stringify(payload) : undefined,
+    });
+  },
+
+  getSessions: async () => {
+    return request<{ sessions: ActiveSessionItem[] }>("/auth/sessions");
+  },
+
+  revokeSession: async (sessionId: string) => {
+    return request<{ success: boolean; message: string }>("/auth/sessions/revoke", {
+      method: "POST",
+      body: JSON.stringify({ sessionId }),
+    });
+  },
+
+  revokeOtherSessions: async () => {
+    return request<{ success: boolean; message: string; count: number }>("/auth/sessions/revoke-others", {
+      method: "POST",
+    });
+  },
+
+  reAuth: async (password: string) => {
+    return request<{ success: boolean; reAuthToken: string; expiresInSeconds: number }>("/auth/reauth", {
+      method: "POST",
+      body: JSON.stringify({ password }),
+    });
   },
 };
 

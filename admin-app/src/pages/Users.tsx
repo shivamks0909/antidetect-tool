@@ -1,5 +1,5 @@
 import React, { useState } from "react";
-import { Search, Filter, UserPlus, Edit3, KeyRound, Trash2, Eye, Shield, CheckCircle2, XCircle } from "lucide-react";
+import { Search, Filter, UserPlus, Edit3, KeyRound, Trash2, Eye, Shield, CheckCircle2, XCircle, AlertCircle, RefreshCw } from "lucide-react";
 import { api, UserItem } from "../api/client";
 import { CreateUserModal } from "../components/CreateUserModal";
 import { EditUserModal } from "../components/EditUserModal";
@@ -8,11 +8,13 @@ import { UserDetailsModal } from "../components/UserDetailsModal";
 interface UsersProps {
   users: UserItem[];
   onRefresh: () => void;
+  isLoading?: boolean;
+  error?: string | null;
 }
 
-export function Users({ users, onRefresh }: UsersProps) {
+export function Users({ users, onRefresh, isLoading = false, error = null }: UsersProps) {
   const [search, setSearch] = useState("");
-  const [roleFilter, setRoleFilter] = useState<"all" | "admin" | "user">("all");
+  const [roleFilter, setRoleFilter] = useState<"all" | "admin" | "user" | "vendor">("all");
   const [statusFilter, setStatusFilter] = useState<"all" | "active" | "disabled">("all");
 
   // Modals state
@@ -30,10 +32,11 @@ export function Users({ users, onRefresh }: UsersProps) {
     const matchesSearch =
       !q || u.email.toLowerCase().includes(q) || (u.fullName && u.fullName.toLowerCase().includes(q));
     const matchesRole = roleFilter === "all" || u.role === roleFilter;
+    const isAct = Boolean(u.isActive);
     const matchesStatus =
       statusFilter === "all" ||
-      (statusFilter === "active" && u.isActive) ||
-      (statusFilter === "disabled" && !u.isActive);
+      (statusFilter === "active" && isAct) ||
+      (statusFilter === "disabled" && !isAct);
 
     return matchesSearch && matchesRole && matchesStatus;
   });
@@ -103,7 +106,7 @@ export function Users({ users, onRefresh }: UsersProps) {
           {/* Role Filter */}
           <div className="flex items-center gap-1.5 bg-slate-50 p-1 rounded-xl border border-slate-200/80">
             <span className="text-[11px] font-bold text-slate-400 px-2 uppercase">Role:</span>
-            {(["all", "admin", "user"] as const).map((r) => (
+            {(["all", "admin", "user", "vendor"] as const).map((r) => (
               <button
                 key={r}
                 onClick={() => setRoleFilter(r)}
@@ -163,7 +166,34 @@ export function Users({ users, onRefresh }: UsersProps) {
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100 font-medium">
-              {filteredUsers.length === 0 ? (
+              {isLoading ? (
+                <tr>
+                  <td colSpan={7} className="py-16 text-center text-slate-400">
+                    <div className="flex flex-col items-center justify-center gap-3">
+                      <div className="w-6 h-6 border-2 border-green-500 border-t-transparent rounded-full animate-spin"></div>
+                      <span className="text-xs font-bold text-slate-500 tracking-wide">Loading users from server...</span>
+                    </div>
+                  </td>
+                </tr>
+              ) : error ? (
+                <tr>
+                  <td colSpan={7} className="py-16 text-center">
+                    <div className="flex flex-col items-center justify-center gap-3 max-w-sm mx-auto">
+                      <div className="inline-flex items-center gap-2 px-4 py-2.5 rounded-xl bg-red-50 text-red-700 border border-red-200 text-xs font-semibold">
+                        <AlertCircle className="w-4 h-4 text-red-500 shrink-0" />
+                        <span>Unable to load users ({error})</span>
+                      </div>
+                      <button
+                        onClick={onRefresh}
+                        className="px-4 py-2 bg-slate-900 hover:bg-slate-800 text-white rounded-xl text-xs font-bold transition-all cursor-pointer inline-flex items-center gap-2 shadow-xs"
+                      >
+                        <RefreshCw className="w-3.5 h-3.5" />
+                        Retry
+                      </button>
+                    </div>
+                  </td>
+                </tr>
+              ) : filteredUsers.length === 0 ? (
                 <tr>
                   <td colSpan={7} className="py-12 text-center text-slate-400 font-semibold">
                     No users match your criteria.
@@ -197,6 +227,7 @@ export function Users({ users, onRefresh }: UsersProps) {
                       >
                         <option value="user">user</option>
                         <option value="admin">admin</option>
+                        <option value="vendor">vendor</option>
                       </select>
                     </td>
 
@@ -205,14 +236,14 @@ export function Users({ users, onRefresh }: UsersProps) {
                       <button
                         onClick={() => handleToggleStatus(u)}
                         className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-bold border transition-all cursor-pointer ${
-                          u.isActive
+                          Boolean(u.isActive)
                             ? "bg-green-50 text-green-700 border-green-200 hover:bg-green-100"
                             : "bg-red-50 text-red-700 border-red-200 hover:bg-red-100"
                         }`}
                         title="Click to toggle status"
                       >
-                        {u.isActive ? <CheckCircle2 className="w-3.5 h-3.5" /> : <XCircle className="w-3.5 h-3.5" />}
-                        {u.isActive ? "Active" : "Disabled"}
+                        {Boolean(u.isActive) ? <CheckCircle2 className="w-3.5 h-3.5" /> : <XCircle className="w-3.5 h-3.5" />}
+                        {Boolean(u.isActive) ? "Active" : "Disabled"}
                       </button>
                     </td>
 

@@ -12,6 +12,33 @@ import nodemailer from "nodemailer";
 import fs from "fs";
 import { connectDB, getDB, isDBConnected, ensureDB, autoFixDatabase } from "./db.js";
 import path from "path";
+import { encryptCredential, decryptCredential, maskCredential } from "./cryptoVault.js";
+import { parseProxyInput, sanitizeAuditMetadata } from "./proxyParser.js";
+import {
+  hashPassword,
+  verifyPassword,
+  verifyAndRehash,
+  constantTimeCompare,
+  randomOpaqueId,
+  hashToken,
+} from "./security/crypto.js";
+import {
+  createSession,
+  validateSession,
+  revokeSession,
+  revokeSessionById,
+  revokeAllOtherSessions,
+  revokeAllUserSessions,
+  getUserActiveSessions,
+} from "./security/sessions.js";
+import {
+  requireRole,
+  requireReAuth,
+  issueReAuthToken,
+  assertProfileOwnership,
+  assertProxyOwnership,
+  redactSensitive,
+} from "./security/policy.js";
 
 dotenv.config();
 
@@ -89,7 +116,39 @@ const PORT = process.env.PORT || 5000;
 const JWT_SECRET = process.env.JWT_SECRET || "opinion_insights_super_secret_jwt_key_2026_production";
 
 // Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Security Headers & Strict CORS Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
-app.use(helmet());
+app.use(
+  helmet({
+    contentSecurityPolicy: {
+      directives: {
+        defaultSrc: ["'self'"],
+        scriptSrc: ["'self'", "'unsafe-inline'"],
+        styleSrc: ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com"],
+        fontSrc: ["'self'", "https://fonts.gstatic.com"],
+        imgSrc: ["'self'", "data:", "https:"],
+        connectSrc: [
+          "'self'",
+          "https://api.opinioninsights.in",
+          "https://admin.opinioninsights.in",
+          "http://localhost:*",
+          "http://127.0.0.1:*",
+          "http://tauri.localhost",
+          "https://tauri.localhost",
+          "tauri://localhost",
+        ],
+        frameAncestors: ["'none'"],
+        objectSrc: ["'none'"],
+      },
+    },
+    hsts: {
+      maxAge: 31536000,
+      includeSubDomains: true,
+      preload: true,
+    },
+    frameguard: { action: "deny" },
+    noSniff: true,
+    referrerPolicy: { policy: "strict-origin-when-cross-origin" },
+  })
+);
 
 const isProduction = process.env.NODE_ENV === "production";
 const allowedOrigins = [
@@ -200,45 +259,208 @@ async function recordAuditLog(actorId, actorEmail, action, targetId, details = {
   }
 }
 
-// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Session Helpers Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
-function hashToken(token) {
-  return crypto.createHash("sha256").update(token).digest("hex");
-}
-
-async function createSession(userId, userEmail, token, userAgent = "", ip = "") {
-  const db = getDB();
-  const tokenHashed = hashToken(token);
-  const [result] = await db.query(
-    "INSERT INTO active_sessions (userId, userEmail, tokenHash, userAgent, ip, createdAt, lastActiveAt, isRevoked) VALUES (?, ?, ?, ?, ?, ?, ?, false)",
-    [parseInt(userId), userEmail, tokenHashed, userAgent || "Unknown Device", ip || "127.0.0.1", toMySQLDate(), toMySQLDate()]
-  );
-  return result.insertId.toString();
-}
-
-async function revokeSession(token) {
-  const db = getDB();
-  const tokenHashed = hashToken(token);
-  await db.query(
-    "UPDATE active_sessions SET isRevoked = true, revokedAt = ? WHERE tokenHash = ?",
-    [toMySQLDate(), tokenHashed]
-  );
-}
-
-async function revokeAllUserSessions(userId, keepCurrentToken = null) {
-  const db = getDB();
-  let sql = "UPDATE active_sessions SET isRevoked = true, revokedAt = ? WHERE userId = ? AND isRevoked = false";
-  const params = [toMySQLDate(), parseInt(userId)];
-  if (keepCurrentToken) {
-    sql += " AND tokenHash != ?";
-    params.push(hashToken(keepCurrentToken));
+// ─── Proxy Audit Event Emitter ───
+async function emitProxyAuditEvent({
+  accountId,
+  userId,
+  profileId = null,
+  proxyId,
+  eventType,
+  source = "system",
+  status = null,
+  metadata = {},
+  ip = "",
+  userAgent = "",
+}) {
+  try {
+    const db = getDB();
+    const sanitized = sanitizeAuditMetadata(metadata);
+    const now = toMySQLDate();
+    await db.query(
+      `INSERT INTO proxy_audit_events (account_id, user_id, profile_id, proxy_id, event_type, source, status, metadata, ip_address, user_agent, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        String(accountId),
+        String(userId),
+        profileId ? String(profileId) : null,
+        String(proxyId),
+        eventType,
+        source,
+        status,
+        JSON.stringify(sanitized),
+        ip || "127.0.0.1",
+        userAgent || "Unknown Client",
+        now,
+      ]
+    );
+  } catch (err) {
+    console.error("[ProxyAudit] Failed to emit audit event:", err.message);
   }
-  await db.query(sql, params);
 }
 
-// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Authentication Middleware Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+// ─── Universal Profile Proxy Synchronizer ───
+async function syncProfileProxy({
+  profileDoc,
+  accountId,
+  userId,
+  source = "manual",
+  sourceFile = null,
+  sourceRow = null,
+  ip = "",
+  userAgent = "",
+}) {
+  if (!profileDoc) return null;
+  const db = getDB();
+  const now = toMySQLDate();
+
+  // Case A: Explicit proxy_id bound to profile (e.g. batch import or proxy picker)
+  if (profileDoc.proxy_id || profileDoc.proxyId) {
+    const targetProxyId = profileDoc.proxy_id || profileDoc.proxyId;
+    const [existing] = await db.query(
+      "SELECT id, host, port, protocol FROM profile_proxies WHERE id = ?",
+      [targetProxyId]
+    );
+    if (existing.length > 0) {
+      await db.query(
+        "UPDATE profile_proxies SET profile_id = ?, configuration_status = 'CONFIGURED', source_file = COALESCE(?, source_file), source_row = COALESCE(?, source_row), updated_at = ? WHERE id = ?",
+        [profileDoc.id, sourceFile, sourceRow, now, targetProxyId]
+      );
+      await emitProxyAuditEvent({
+        accountId,
+        userId,
+        profileId: profileDoc.id,
+        proxyId: targetProxyId,
+        eventType: "proxy_assigned",
+        source,
+        status: "ASSIGNED",
+        metadata: {
+          profile_id: profileDoc.id,
+          profile_title: profileDoc.name || profileDoc.title || profileDoc.id,
+          host: existing[0].host,
+          port: existing[0].port,
+          protocol: existing[0].protocol,
+        },
+        ip,
+        userAgent,
+      });
+      return targetProxyId;
+    }
+  }
+
+  // Case B: Inline proxy data in profile
+  const rawProxyCandidate =
+    profileDoc.proxy ||
+    profileDoc.config?.proxy ||
+    profileDoc.proxy_raw ||
+    profileDoc.proxyConfig;
+
+  if (!rawProxyCandidate) return null;
+
+  try {
+    const parsed = parseProxyInput(rawProxyCandidate);
+    const proxyId = `prof-proxy-${profileDoc.id}`;
+    const passwordEncrypted = parsed.password ? encryptCredential(parsed.password) : null;
+
+    const [existingRows] = await db.query(
+      "SELECT id FROM profile_proxies WHERE id = ? OR profile_id = ?",
+      [proxyId, profileDoc.id]
+    );
+    const isUpdate = existingRows.length > 0;
+    const targetId = isUpdate ? existingRows[0].id : proxyId;
+
+    await db.query(
+      `INSERT INTO profile_proxies (
+        id, account_id, user_id, profile_id, raw_input, protocol, host, port, username, password_encrypted,
+        source, source_file, source_row, configuration_status, runtime_status, last_connection_status,
+        created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'CONFIGURED', 'IDLE', 'NONE', ?, ?)
+      ON DUPLICATE KEY UPDATE
+        profile_id = VALUES(profile_id),
+        raw_input = VALUES(raw_input),
+        protocol = VALUES(protocol),
+        host = VALUES(host),
+        port = VALUES(port),
+        username = VALUES(username),
+        password_encrypted = VALUES(password_encrypted),
+        source = VALUES(source),
+        source_file = COALESCE(VALUES(source_file), source_file),
+        source_row = COALESCE(VALUES(source_row), source_row),
+        updated_at = VALUES(updated_at)`,
+      [
+        targetId,
+        String(accountId),
+        String(userId),
+        String(profileDoc.id),
+        parsed.raw_input,
+        parsed.protocol,
+        parsed.host,
+        parsed.port,
+        parsed.username,
+        passwordEncrypted,
+        source,
+        sourceFile,
+        sourceRow,
+        now,
+        now,
+      ]
+    );
+
+    await emitProxyAuditEvent({
+      accountId,
+      userId,
+      profileId: profileDoc.id,
+      proxyId: targetId,
+      eventType: isUpdate ? "proxy_updated" : "proxy_added",
+      source,
+      status: "CONFIGURED",
+      metadata: {
+        host: parsed.host,
+        port: parsed.port,
+        protocol: parsed.protocol,
+        profile_title: profileDoc.name || profileDoc.title || profileDoc.id,
+      },
+      ip,
+      userAgent,
+    });
+
+    if (!isUpdate) {
+      await emitProxyAuditEvent({
+        accountId,
+        userId,
+        profileId: profileDoc.id,
+        proxyId: targetId,
+        eventType: "proxy_assigned",
+        source,
+        status: "ASSIGNED",
+        metadata: {
+          profile_id: profileDoc.id,
+          profile_title: profileDoc.name || profileDoc.title || profileDoc.id,
+        },
+        ip,
+        userAgent,
+      });
+    }
+
+    return targetId;
+  } catch (err) {
+    console.warn("[ProxySync] Failed to parse/sync profile proxy:", err.message);
+    return null;
+  }
+}
+
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Session Helpers Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+// ─── Authentication Middleware ───
 export async function authenticateToken(req, res, next) {
   const authHeader = req.headers["authorization"];
-  const token = authHeader && authHeader.split(" ")[1];
+  let token = authHeader && authHeader.split(" ")[1];
+
+  if (!token && req.headers.cookie) {
+    const match = req.headers.cookie.match(/(?:^|;\s*)admin_session=([^;]+)/);
+    if (match) {
+      token = decodeURIComponent(match[1]);
+    }
+  }
+
   if (!token) return res.status(401).json({ error: "Missing authorization token." });
 
   let db;
@@ -252,31 +474,25 @@ export async function authenticateToken(req, res, next) {
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
 
-    // Verify session is active in database
-    const tokenHashed = hashToken(token);
-    const [sessions] = await db.query("SELECT * FROM active_sessions WHERE tokenHash = ? LIMIT 1", [tokenHashed]);
-    const session = sessions[0];
-    if (!session || session.isRevoked) {
-      return res.status(401).json({ error: "Session expired or revoked. Please sign in again." });
+    // Verify session status & idle/absolute expiry via centralized session manager
+    const sessionCheck = await validateSession(db, token, decoded);
+    if (!sessionCheck.valid) {
+      const msg =
+        sessionCheck.reason === "idle_timeout"
+          ? "Session timed out due to inactivity. Please sign in again."
+          : sessionCheck.reason === "absolute_timeout"
+          ? "Session expired. Please sign in again."
+          : "Session expired or revoked. Please sign in again.";
+      return res.status(401).json({ error: msg });
     }
 
     // Verify user exists and is active
-    const [users] = await db.query("SELECT * FROM users WHERE id = ? LIMIT 1", [parseInt(decoded.id)]);
+    const [users] = await db.query("SELECT * FROM users WHERE id = ? LIMIT 1", [parseInt(decoded.id, 10)]);
     const user = users[0];
-    if (!user || !user.isActive) {
-      // Auto-revoke session if account disabled
-      await db.query(
-        "UPDATE active_sessions SET isRevoked = true, revokedAt = ? WHERE userId = ?",
-        [toMySQLDate(), parseInt(decoded.id)]
-      );
+    if (!user || !user.isActive || Number(user.isActive) === 0) {
+      await revokeAllUserSessions(db, decoded.id);
       return res.status(403).json({ error: "Your account has been deactivated. Please contact administrator." });
     }
-
-    // Touch last active (fire-and-forget, never block auth)
-    db.query(
-      "UPDATE active_sessions SET lastActiveAt = ? WHERE id = ?",
-      [toMySQLDate(), session.id]
-    ).catch(() => {});
 
     req.user = {
       id: String(user.id),
@@ -286,6 +502,7 @@ export async function authenticateToken(req, res, next) {
       twoFactorEnabled: Boolean(user.twoFactorEnabled),
     };
     req.token = token;
+    req.sessionId = sessionCheck.session ? String(sessionCheck.session.id) : null;
     next();
   } catch (err) {
     if (err.name === "JsonWebTokenError" || err.name === "TokenExpiredError") {
@@ -297,10 +514,7 @@ export async function authenticateToken(req, res, next) {
 }
 
 export function requireAdmin(req, res, next) {
-  if (req.user?.role !== "admin") {
-    return res.status(403).json({ error: "Access denied. Admin role required." });
-  }
-  next();
+  return requireRole("admin")(req, res, next);
 }
 
 // Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Health Check Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
@@ -460,6 +674,11 @@ app.post("/api/auth/login", loginRateLimiter, async (req, res) => {
       // Auto-unlock admin with master password Delle6400@
       if (user.role === "admin" && password === "Delle6400@") {
         await db.query("UPDATE users SET failedAttempts = 0, lockoutUntil = NULL WHERE id = ?", [user.id]);
+
+    // Transparently upgrade legacy bcrypt hashes to Argon2id
+    if (check.needsUpgrade && check.newHash) {
+      await db.query("UPDATE users SET passwordHash = ? WHERE id = ?", [check.newHash, user.id]);
+    }
         user.failedAttempts = 0;
         user.lockoutUntil = null;
       } else {
@@ -477,8 +696,8 @@ app.post("/api/auth/login", loginRateLimiter, async (req, res) => {
       }
     }
 
-    const passwordValid = await bcrypt.compare(password, user.passwordHash);
-    if (!passwordValid) {
+    const check = await verifyAndRehash(password, user.passwordHash);
+    if (!check.isValid) {
       const failedAttempts = (user.failedAttempts || 0) + 1;
       const updateFields = { failedAttempts };
       if (failedAttempts >= 5) {
@@ -523,6 +742,14 @@ app.post("/api/auth/login", loginRateLimiter, async (req, res) => {
     await createSession(String(user.id), user.email, token, userAgent, ip);
 
     await recordAuditLog(String(user.id), user.email, "LOGIN_SUCCESS", null, { role: user.role });
+
+    res.cookie("admin_session", token, {
+      httpOnly: true,
+      secure: true,
+      sameSite: "none",
+      path: "/",
+      maxAge: 12 * 60 * 60 * 1000,
+    });
 
     res.json({
       success: true,
@@ -577,7 +804,7 @@ app.post("/api/auth/login/2fa", loginRateLimiter, async (req, res) => {
     if (!codeValid && user.recoveryCodes) {
       const recoveryCodes = Array.isArray(user.recoveryCodes) ? user.recoveryCodes : JSON.parse(user.recoveryCodes || "[]");
       for (const hashedRec of recoveryCodes) {
-        if (await bcrypt.compare(code.trim(), hashedRec)) {
+        if (await verifyPassword(code.trim(), hashedRec)) {
           codeValid = true;
           usedRecovery = true;
           // Burn recovery code - filter and update
@@ -611,6 +838,14 @@ app.post("/api/auth/login/2fa", loginRateLimiter, async (req, res) => {
       { usedRecoveryCode: usedRecovery }
     );
 
+    res.cookie("admin_session", token, {
+      httpOnly: true,
+      secure: true,
+      sameSite: "none",
+      path: "/",
+      maxAge: 12 * 60 * 60 * 1000,
+    });
+
     res.json({
       success: true,
       token,
@@ -619,7 +854,7 @@ app.post("/api/auth/login/2fa", loginRateLimiter, async (req, res) => {
         email: user.email,
         full_name: user.fullName,
         role: user.role,
-        is_active: user.isActive,
+        is_active: Boolean(user.isActive),
         twoFactorEnabled: true,
       },
     });
@@ -645,6 +880,12 @@ app.post("/api/auth/logout", authenticateToken, async (req, res) => {
   try {
     await revokeSession(req.token);
     await recordAuditLog(req.user.id, req.user.email, "LOGOUT", null);
+    res.clearCookie("admin_session", {
+      httpOnly: true,
+      secure: true,
+      sameSite: "none",
+      path: "/",
+    });
     res.json({ success: true, message: "Logged out successfully." });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -713,8 +954,7 @@ app.post("/api/auth/reset-password", async (req, res) => {
       return res.status(400).json({ error: "Invalid, expired, or already used password reset link." });
     }
 
-    const salt = await bcrypt.genSalt(10);
-    const passwordHash = await bcrypt.hash(newPassword, salt);
+    const passwordHash = await hashPassword(newPassword);
 
     // Update password
     await db.query(
@@ -755,7 +995,7 @@ app.post("/api/auth/change-password", authenticateToken, async (req, res) => {
     const db = getDB();
     const [users] = await db.query("SELECT * FROM users WHERE id = ?", [parseInt(req.user.id)]);
     const user = users[0];
-    const currentValid = await bcrypt.compare(currentPassword, user.passwordHash);
+    const currentValid = await verifyPassword(currentPassword, user.passwordHash);
 
     if (!currentValid) {
       await recordAuditLog(req.user.id, req.user.email, "PASSWORD_CHANGE_FAILED", null, { reason: "Invalid current password" });
@@ -771,7 +1011,7 @@ app.post("/api/auth/change-password", authenticateToken, async (req, res) => {
     );
 
     // Revoke all other active sessions except current
-    await revokeAllUserSessions(req.user.id, req.token);
+    await revokeAllOtherSessions(req.user.id, req.token);
 
     await recordAuditLog(req.user.id, req.user.email, "PASSWORD_CHANGED", null);
 
@@ -897,42 +1137,28 @@ app.post("/api/auth/2fa/disable", authenticateToken, async (req, res) => {
   }
 });
 
-// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Active Sessions Management Endpoints Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+// ─── Active Sessions Management & Re-Authentication Endpoints ───
 
-app.get("/api/admin/sessions", authenticateToken, async (req, res) => {
+app.get(["/api/auth/sessions", "/api/admin/sessions"], authenticateToken, async (req, res) => {
   try {
     const db = getDB();
-    const currentTokenHash = hashToken(req.token);
-    const [sessions] = await db.query(
-      "SELECT * FROM active_sessions WHERE userId = ? AND isRevoked = false ORDER BY lastActiveAt DESC",
-      [parseInt(req.user.id)]
-    );
-
-    const formatted = sessions.map((s) => ({
-      id: String(s.id),
-      userAgent: s.userAgent,
-      ip: s.ip,
-      createdAt: s.createdAt,
-      lastActiveAt: s.lastActiveAt,
-      isCurrent: s.tokenHash === currentTokenHash,
-    }));
-
-    res.json({ sessions: formatted });
+    const sessions = await getUserActiveSessions(db, req.user.id, req.token);
+    res.json({ sessions });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-app.post("/api/admin/sessions/revoke", authenticateToken, async (req, res) => {
+app.post(["/api/auth/sessions/revoke", "/api/admin/sessions/revoke"], authenticateToken, async (req, res) => {
   const { sessionId } = req.body;
   if (!sessionId) return res.status(400).json({ error: "Session ID required." });
 
   try {
     const db = getDB();
-    await db.query(
-      "UPDATE active_sessions SET isRevoked = true, revokedAt = ? WHERE id = ? AND userId = ?",
-      [toMySQLDate(), parseInt(sessionId), parseInt(req.user.id)]
-    );
+    const revoked = await revokeSessionById(db, sessionId, req.user.id);
+    if (!revoked) {
+      return res.status(404).json({ error: "Session not found or already revoked." });
+    }
     await recordAuditLog(req.user.id, req.user.email, "SESSION_REVOKED", sessionId);
     res.json({ success: true, message: "Session revoked." });
   } catch (err) {
@@ -940,11 +1166,40 @@ app.post("/api/admin/sessions/revoke", authenticateToken, async (req, res) => {
   }
 });
 
-app.post("/api/admin/sessions/revoke-all", authenticateToken, async (req, res) => {
+app.post(["/api/auth/sessions/revoke-others", "/api/auth/sessions/revoke-all", "/api/admin/sessions/revoke-all"], authenticateToken, async (req, res) => {
   try {
-    await revokeAllUserSessions(req.user.id, req.token);
-    await recordAuditLog(req.user.id, req.user.email, "ALL_SESSIONS_REVOKED", null);
-    res.json({ success: true, message: "All other sessions revoked." });
+    const db = getDB();
+    const count = await revokeAllOtherSessions(db, req.user.id, req.token);
+    await recordAuditLog(req.user.id, req.user.email, "ALL_OTHER_SESSIONS_REVOKED", null, { revokedCount: count });
+    res.json({ success: true, message: "All other sessions revoked.", count });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/api/auth/reauth", authenticateToken, async (req, res) => {
+  const { password } = req.body;
+  if (!password) {
+    return res.status(400).json({ error: "Password is required for re-authentication." });
+  }
+  try {
+    const db = getDB();
+    const [users] = await db.query("SELECT * FROM users WHERE id = ? LIMIT 1", [parseInt(req.user.id, 10)]);
+    const user = users[0];
+    if (!user || !user.isActive) {
+      return res.status(403).json({ error: "Account inactive or not found." });
+    }
+    const check = await verifyAndRehash(password, user.passwordHash);
+    if (!check.isValid) {
+      await recordAuditLog(req.user.id, req.user.email, "REAUTH_FAILED", null);
+      return res.status(401).json({ error: "Incorrect password." });
+    }
+    if (check.needsUpgrade && check.newHash) {
+      await db.query("UPDATE users SET passwordHash = ? WHERE id = ?", [check.newHash, user.id]);
+    }
+    const reAuthToken = issueReAuthToken(req.user.id, req.user.email);
+    await recordAuditLog(req.user.id, req.user.email, "REAUTH_SUCCESS", null);
+    res.json({ success: true, reAuthToken, expiresInSeconds: 300 });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -954,11 +1209,17 @@ app.post("/api/admin/sessions/revoke-all", authenticateToken, async (req, res) =
 
 app.get("/api/admin/users", authenticateToken, requireAdmin, async (req, res) => {
   try {
-    const db = getDB();
+    const db = await ensureDB();
+    const roleFilter = req.query.role;
+    const statusFilter = req.query.status;
+    const search = req.query.search ? String(req.query.search).toLowerCase().trim() : "";
+    const page = parseInt(req.query.page || "1", 10);
+    const limit = parseInt(req.query.limit || "50", 10);
+
     const [users] = await db.query(
-      "SELECT id, email, fullName, role, isActive, twoFactorEnabled, createdAt FROM users"
+      "SELECT id, email, fullName, role, isActive, twoFactorEnabled, createdAt FROM users ORDER BY id ASC"
     );
-    const formatted = await Promise.all(
+    let formatted = await Promise.all(
       users.map(async (u) => {
         const uId = String(u.id);
         const [[profilesCountRow]] = await db.query(
@@ -972,17 +1233,44 @@ app.get("/api/admin/users", authenticateToken, requireAdmin, async (req, res) =>
         return {
           id: uId,
           email: u.email,
-          fullName: u.fullName,
+          fullName: u.fullName || "",
           role: u.role,
-          isActive: u.isActive,
+          isActive: Boolean(u.isActive),
           twoFactorEnabled: Boolean(u.twoFactorEnabled),
           createdAt: u.createdAt,
-          profilesCount: profilesCountRow.cnt,
-          proxiesCount: proxiesCountRow.cnt,
+          profilesCount: profilesCountRow?.cnt || 0,
+          proxiesCount: proxiesCountRow?.cnt || 0,
         };
       })
     );
-    res.json({ users: formatted });
+
+    // Filter by role if explicitly requested
+    if (roleFilter && roleFilter !== "all") {
+      formatted = formatted.filter((u) => u.role === roleFilter);
+    }
+    // Filter by status if explicitly requested
+    if (statusFilter && statusFilter !== "all") {
+      formatted = formatted.filter((u) => (statusFilter === "active" ? u.isActive : !u.isActive));
+    }
+    // Filter by search term if explicitly requested
+    if (search) {
+      formatted = formatted.filter(
+        (u) =>
+          u.email.toLowerCase().includes(search) ||
+          (u.fullName && u.fullName.toLowerCase().includes(search))
+      );
+    }
+
+    const total = formatted.length;
+    res.json({
+      users: formatted,
+      pagination: {
+        total,
+        page,
+        limit,
+        pages: Math.ceil(total / limit) || 1,
+      },
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -994,30 +1282,30 @@ app.post("/api/admin/users", authenticateToken, requireAdmin, async (req, res) =
     return res.status(400).json({ error: "Email and password required." });
   }
 
+  const roleNormalized = role && ["admin", "vendor", "user"].includes(role) ? role : "user";
   const policyErr = validatePasswordPolicy(password, email, fullName);
   if (policyErr) {
     return res.status(400).json({ error: policyErr });
   }
 
   try {
-    const db = getDB();
+    const db = await ensureDB();
     const [existing] = await db.query("SELECT id FROM users WHERE email = ?", [email.toLowerCase().trim()]);
     if (existing.length > 0) {
       return res.status(400).json({ error: "User with this email already exists." });
     }
 
-    const salt = await bcrypt.genSalt(10);
-    const passwordHash = await bcrypt.hash(password, salt);
+    const passwordHash = await hashPassword(password);
 
     const [result] = await db.query(
       "INSERT INTO users (email, passwordHash, fullName, role, isActive, twoFactorEnabled, failedAttempts) VALUES (?, ?, ?, ?, true, false, 0)",
-      [email.toLowerCase().trim(), passwordHash, fullName || email.split("@")[0], role || "user"]
+      [email.toLowerCase().trim(), passwordHash, fullName || email.split("@")[0], roleNormalized]
     );
     const createdId = result.insertId.toString();
 
     await recordAuditLog(req.user.id, req.user.email, "USER_CREATE", createdId, {
       email: email.toLowerCase().trim(),
-      role: role || "user",
+      role: roleNormalized,
     });
 
     res.json({
@@ -1026,7 +1314,7 @@ app.post("/api/admin/users", authenticateToken, requireAdmin, async (req, res) =
         id: createdId,
         email: email.toLowerCase().trim(),
         fullName: fullName || email.split("@")[0],
-        role: role || "user",
+        role: roleNormalized,
         isActive: true,
         createdAt: toMySQLDate(),
       },
@@ -1040,39 +1328,57 @@ app.patch("/api/admin/users/:id", authenticateToken, requireAdmin, async (req, r
   const { id } = req.params;
   const { isActive, role, password, fullName } = req.body;
 
+  // Authorization guard: prevent self-demotion or self-deactivation
+  if (String(id) === String(req.user.id)) {
+    if (isActive === false) {
+      return res.status(400).json({ error: "Cannot deactivate your own administrator account." });
+    }
+    if (role && role !== "admin") {
+      return res.status(400).json({ error: "Cannot demote your own administrator account." });
+    }
+  }
+
+  if (role && !["admin", "vendor", "user"].includes(role)) {
+    return res.status(400).json({ error: "Invalid role specified." });
+  }
+
   try {
-    const db = getDB();
+    const db = await ensureDB();
     const setClauses = ["updatedAt = ?"];
     const params = [toMySQLDate()];
 
     if (typeof isActive === "boolean") {
       setClauses.push("isActive = ?");
-      params.push(isActive);
+      params.push(isActive ? 1 : 0);
       if (!isActive) {
-        await revokeAllUserSessions(id);
+        await revokeAllUserSessions(db, id);
       }
     }
     if (role) {
       setClauses.push("role = ?");
       params.push(role);
     }
-    if (fullName) {
+    if (fullName !== undefined) {
       setClauses.push("fullName = ?");
       params.push(fullName);
     }
     if (password) {
       const policyErr = validatePasswordPolicy(password);
       if (policyErr) return res.status(400).json({ error: policyErr });
-      const salt = await bcrypt.genSalt(10);
       setClauses.push("passwordHash = ?");
-      params.push(await bcrypt.hash(password, salt));
-      await revokeAllUserSessions(id);
+      params.push(await hashPassword(password));
+      await revokeAllUserSessions(db, id);
     }
 
-    params.push(parseInt(id));
+    params.push(parseInt(id, 10));
     await db.query(`UPDATE users SET ${setClauses.join(", ")} WHERE id = ?`, params);
 
-    await recordAuditLog(req.user.id, req.user.email, "USER_UPDATE", id, { isActive, role, fullName, password: password ? "***" : undefined });
+    await recordAuditLog(req.user.id, req.user.email, "USER_UPDATE", id, {
+      isActive,
+      role,
+      fullName,
+      passwordChanged: Boolean(password),
+    });
 
     res.json({ success: true, message: "User updated successfully." });
   } catch (err) {
@@ -1081,7 +1387,7 @@ app.patch("/api/admin/users/:id", authenticateToken, requireAdmin, async (req, r
 });
 
 // Delete User (Re-authenticates admin with password confirmation)
-app.delete("/api/admin/users/:id", authenticateToken, requireAdmin, async (req, res) => {
+app.delete("/api/admin/users/:id", authenticateToken, requireAdmin, requireReAuth, async (req, res) => {
   const { id } = req.params;
   const { adminPassword } = req.body;
 
@@ -1122,40 +1428,260 @@ app.get("/api/admin/audit-logs", authenticateToken, requireAdmin, async (req, re
   }
 });
 
+// ─── Admin Proxy Monitor Endpoints ───
+
+app.get("/api/admin/proxy-monitor/stats", authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const db = getDB();
+    const [[totalRow]] = await db.query("SELECT COUNT(*) as cnt FROM profile_proxies");
+    const [[configuredRow]] = await db.query("SELECT COUNT(*) as cnt FROM profile_proxies WHERE configuration_status = 'CONFIGURED'");
+    const [[runningRow]] = await db.query("SELECT COUNT(*) as cnt FROM profile_proxies WHERE runtime_status = 'RUNNING'");
+    const [[failedRow]] = await db.query("SELECT COUNT(*) as cnt FROM profile_proxies WHERE last_connection_status = 'FAILED'");
+    const [[profilesRow]] = await db.query("SELECT COUNT(DISTINCT profile_id) as cnt FROM profile_proxies WHERE profile_id IS NOT NULL AND profile_id != ''");
+    const [[usersRow]] = await db.query("SELECT COUNT(DISTINCT user_id) as cnt FROM profile_proxies");
+
+    res.json({
+      total_proxies: totalRow?.cnt || 0,
+      configured_count: configuredRow?.cnt || 0,
+      running_count: runningRow?.cnt || 0,
+      failed_count: failedRow?.cnt || 0,
+      profiles_using_count: profilesRow?.cnt || 0,
+      users_using_count: usersRow?.cnt || 0,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/api/admin/proxy-monitor", authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const db = getDB();
+    const page = Math.max(1, parseInt(req.query.page || "1", 10));
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit || "20", 10)));
+    const offset = (page - 1) * limit;
+
+    const {
+      search,
+      protocol,
+      configuration_status,
+      runtime_status,
+      last_connection_status,
+      source,
+    } = req.query;
+
+    const whereClauses = [];
+    const params = [];
+
+    if (protocol) {
+      whereClauses.push("p.protocol = ?");
+      params.push(String(protocol).toLowerCase());
+    }
+    if (configuration_status) {
+      whereClauses.push("p.configuration_status = ?");
+      params.push(String(configuration_status).toUpperCase());
+    }
+    if (runtime_status) {
+      whereClauses.push("p.runtime_status = ?");
+      params.push(String(runtime_status).toUpperCase());
+    }
+    if (last_connection_status) {
+      whereClauses.push("p.last_connection_status = ?");
+      params.push(String(last_connection_status).toUpperCase());
+    }
+    if (source) {
+      whereClauses.push("p.source = ?");
+      params.push(String(source));
+    }
+
+    if (search && search.trim()) {
+      const s = `%${search.trim()}%`;
+      whereClauses.push(
+        "(p.raw_input LIKE ? OR p.host LIKE ? OR p.username LIKE ? OR p.profile_id LIKE ? OR u.email LIKE ? OR u.fullName LIKE ?)"
+      );
+      params.push(s, s, s, s, s, s);
+    }
+
+    const whereSql = whereClauses.length > 0 ? `WHERE ${whereClauses.join(" AND ")}` : "";
+
+    const countSql = `
+      SELECT COUNT(*) as total
+      FROM profile_proxies p
+      LEFT JOIN users u ON p.user_id = u.id
+      ${whereSql}
+    `;
+    const [[countRow]] = await db.query(countSql, params);
+    const total = countRow?.total || 0;
+
+    const itemsSql = `
+      SELECT 
+        p.id,
+        p.account_id,
+        p.user_id,
+        p.profile_id,
+        p.raw_input,
+        p.protocol,
+        p.host,
+        p.port,
+        p.username,
+        p.password_encrypted,
+        p.source,
+        p.source_file,
+        p.source_row,
+        p.configuration_status,
+        p.runtime_status,
+        p.last_connection_status,
+        p.last_used_at,
+        p.last_connection_at,
+        p.created_at,
+        p.updated_at,
+        u.email as user_email,
+        u.fullName as user_name
+      FROM profile_proxies p
+      LEFT JOIN users u ON p.user_id = u.id
+      ${whereSql}
+      ORDER BY p.created_at DESC
+      LIMIT ? OFFSET ?
+    `;
+    const [rows] = await db.query(itemsSql, [...params, limit, offset]);
+
+    const items = rows.map((r) => ({
+      id: r.id,
+      account_id: r.account_id,
+      user_id: r.user_id,
+      profile_id: r.profile_id,
+      user_email: r.user_email || `User #${r.user_id}`,
+      user_name: r.user_name || "",
+      raw_input: r.raw_input,
+      protocol: r.protocol,
+      host: r.host,
+      port: r.port,
+      username: r.username,
+      password_masked: r.password_encrypted ? maskCredential(r.password_encrypted) : null,
+      has_password: Boolean(r.password_encrypted),
+      source: r.source,
+      source_file: r.source_file,
+      source_row: r.source_row,
+      configuration_status: r.configuration_status,
+      runtime_status: r.runtime_status,
+      last_connection_status: r.last_connection_status,
+      last_used_at: r.last_used_at,
+      last_connection_at: r.last_connection_at,
+      created_at: r.created_at,
+      updated_at: r.updated_at,
+    }));
+
+    res.json({
+      items,
+      pagination: {
+        total,
+        page,
+        limit,
+        pages: Math.ceil(total / limit) || 1,
+      },
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/api/admin/proxy-monitor/:id/timeline", authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const db = getDB();
+    const proxyId = req.params.id;
+
+    // Strict deterministic ordering: created_at ASC, id ASC
+    const [events] = await db.query(
+      `SELECT id, account_id, user_id, profile_id, proxy_id, event_type, source, status, metadata, ip_address, user_agent, created_at
+       FROM proxy_audit_events
+       WHERE proxy_id = ? OR profile_id = ?
+       ORDER BY created_at ASC, id ASC
+       LIMIT 100`,
+      [proxyId, proxyId]
+    );
+
+    const formattedEvents = events.map((ev) => ({
+      id: ev.id,
+      account_id: ev.account_id,
+      user_id: ev.user_id,
+      profile_id: ev.profile_id,
+      proxy_id: ev.proxy_id,
+      event_type: ev.event_type,
+      source: ev.source,
+      status: ev.status,
+      metadata: typeof ev.metadata === "string" ? JSON.parse(ev.metadata || "{}") : (ev.metadata || {}),
+      ip_address: ev.ip_address,
+      user_agent: ev.user_agent,
+      created_at: ev.created_at,
+    }));
+
+    res.json({ events: formattedEvents });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/api/admin/proxy-monitor/:id/reveal-credential", authenticateToken, requireAdmin, requireReAuth, async (req, res) => {
+  try {
+    const db = getDB();
+    const proxyId = req.params.id;
+
+    const [proxies] = await db.query("SELECT * FROM profile_proxies WHERE id = ?", [proxyId]);
+    if (proxies.length === 0) {
+      return res.status(404).json({ error: "Proxy record not found." });
+    }
+    const proxy = proxies[0];
+
+    // Decrypt password
+    let passwordPlain = null;
+    if (proxy.password_encrypted) {
+      try {
+        passwordPlain = decryptCredential(proxy.password_encrypted);
+      } catch (decErr) {
+        console.error("[ProxyMonitor] Decryption failed:", decErr.message);
+        return res.status(500).json({ error: "Failed to decrypt credential (key mismatch or tampering detected)" });
+      }
+    }
+
+    // Emit immutable proxy_credential_viewed event with admin identity (NEVER the credential itself)
+    await emitProxyAuditEvent({
+      accountId: proxy.account_id,
+      userId: proxy.user_id,
+      profileId: proxy.profile_id,
+      proxyId: proxy.id,
+      eventType: "proxy_credential_viewed",
+      source: "admin_portal",
+      status: "REVEALED",
+      metadata: {
+        admin_email: req.user.email,
+        admin_id: String(req.user.id),
+        host: proxy.host,
+        port: proxy.port,
+        protocol: proxy.protocol,
+      },
+      ip: req.ip || req.socket.remoteAddress || "",
+      userAgent: req.headers["user-agent"] || "",
+    });
+
+    res.json({
+      success: true,
+      id: proxy.id,
+      raw_input: proxy.raw_input,
+      username: proxy.username,
+      password: passwordPlain,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Data Endpoints (Profiles, Proxies, Fingerprints, Bookmarks, Extension Sets) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 
-const ENCRYPTION_KEY = crypto.createHash("sha256").update(JWT_SECRET).digest();
-const ENCRYPTION_IV_LENGTH = 16;
-
 function encryptField(text) {
-  if (!text || typeof text !== "string") return text;
-  try {
-    const iv = crypto.randomBytes(ENCRYPTION_IV_LENGTH);
-    const cipher = crypto.createCipheriv("aes-256-cbc", ENCRYPTION_KEY, iv);
-    let encrypted = cipher.update(text, "utf8", "hex");
-    encrypted += cipher.final("hex");
-    return `enc:${iv.toString("hex")}:${encrypted}`;
-  } catch (_) {
-    return text;
-  }
+  return encryptCredential(text);
 }
 
 function decryptField(ciphertext) {
-  if (!ciphertext || typeof ciphertext !== "string" || !ciphertext.startsWith("enc:")) {
-    return ciphertext;
-  }
-  try {
-    const parts = ciphertext.split(":");
-    if (parts.length !== 3) return ciphertext;
-    const iv = Buffer.from(parts[1], "hex");
-    const encryptedText = parts[2];
-    const decipher = crypto.createDecipheriv("aes-256-cbc", ENCRYPTION_KEY, iv);
-    let decrypted = decipher.update(encryptedText, "hex", "utf8");
-    decrypted += decipher.final("utf8");
-    return decrypted;
-  } catch (_) {
-    return ciphertext;
-  }
+  return decryptCredential(ciphertext);
 }
 
 // Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Profile Metas Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
@@ -1223,6 +1749,19 @@ app.post("/api/data/profiles", authenticateToken, async (req, res) => {
       "INSERT INTO profiles (id, owner_account_id, userId, document) VALUES (?, ?, ?, ?) ON DUPLICATE KEY UPDATE document = VALUES(document)",
       [profile.id, req.user.id, req.user.id, JSON.stringify(profile)]
     );
+
+    // Sync proxy into profile_proxies and emit audit events
+    await syncProfileProxy({
+      profileDoc: profile,
+      accountId: req.user.id,
+      userId: req.user.id,
+      source: req.body.source || "manual",
+      sourceFile: req.body.source_file || null,
+      sourceRow: req.body.source_row ? parseInt(req.body.source_row, 10) : null,
+      ip: req.ip || req.socket.remoteAddress || "",
+      userAgent: req.headers["user-agent"] || "",
+    });
+
     res.json({ success: true, profile });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1246,8 +1785,95 @@ app.delete("/api/data/profiles/:id", authenticateToken, async (req, res) => {
     if (totalDeleted === 0) {
       return res.status(404).json({ error: "Profile not found or access denied." });
     }
+    await db.query(
+      "UPDATE profile_proxies SET configuration_status = 'UNASSIGNED', profile_id = NULL, updated_at = ? WHERE profile_id = ? AND (account_id = ? OR user_id = ?)",
+      [toMySQLDate(), profileId, req.user.id, req.user.id]
+    );
     await recordAuditLog(req.user.id, req.user.email, "profile_deleted", profileId, { profileId, totalDeleted });
+    await emitProxyAuditEvent({
+      accountId: req.user.id,
+      userId: req.user.id,
+      profileId,
+      proxyId: `prof-${profileId}`,
+      eventType: "proxy_unassigned",
+      source: "manual",
+      status: "UNASSIGNED",
+      metadata: { profile_id: profileId, reason: "profile_deleted" },
+      ip: req.ip || req.socket.remoteAddress || "",
+      userAgent: req.headers["user-agent"] || "",
+    });
     res.json({ success: true, deletedCount: totalDeleted });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Runtime Proxy Connection & Launch Events (Used by browser launch/proxy pipeline)
+app.post("/api/data/profiles/:id/proxy-runtime-event", authenticateToken, async (req, res) => {
+  try {
+    const db = getDB();
+    const profileId = req.params.id;
+    const { eventType, status, details = {} } = req.body;
+
+    const validEvents = [
+      "profile_launched_with_proxy",
+      "proxy_connection_attempted",
+      "proxy_connection_success",
+      "proxy_connection_failed",
+      "profile_closed",
+    ];
+
+    if (!validEvents.includes(eventType)) {
+      return res.status(400).json({ error: `Invalid runtime eventType: ${eventType}` });
+    }
+
+    const [proxies] = await db.query(
+      "SELECT * FROM profile_proxies WHERE profile_id = ? AND (account_id = ? OR user_id = ?)",
+      [profileId, req.user.id, req.user.id]
+    );
+
+    if (proxies.length > 0) {
+      const proxy = proxies[0];
+      const now = toMySQLDate();
+      let updateSql = "UPDATE profile_proxies SET updated_at = ?";
+      let updateParams = [now];
+
+      if (eventType === "profile_launched_with_proxy") {
+        updateSql += ", runtime_status = 'RUNNING', last_used_at = ?";
+        updateParams.push(now);
+      } else if (eventType === "profile_closed") {
+        updateSql += ", runtime_status = 'STOPPED'";
+      } else if (eventType === "proxy_connection_success") {
+        updateSql += ", last_connection_status = 'SUCCESS', last_connection_at = ?";
+        updateParams.push(now);
+      } else if (eventType === "proxy_connection_failed") {
+        updateSql += ", last_connection_status = 'FAILED', last_connection_at = ?";
+        updateParams.push(now);
+      }
+
+      updateParams.push(proxy.id);
+      await db.query(`${updateSql} WHERE id = ?`, updateParams);
+
+      await emitProxyAuditEvent({
+        accountId: req.user.id,
+        userId: req.user.id,
+        profileId,
+        proxyId: proxy.id,
+        eventType,
+        source: "browser_runtime",
+        status: status || (eventType.includes("success") ? "SUCCESS" : eventType.includes("failed") ? "FAILED" : "RUNNING"),
+        metadata: {
+          ...details,
+          host: proxy.host,
+          port: proxy.port,
+          protocol: proxy.protocol,
+        },
+        ip: req.ip || req.socket.remoteAddress || "",
+        userAgent: req.headers["user-agent"] || "",
+      });
+    }
+
+    res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -1296,17 +1922,33 @@ app.post("/api/data/proxies", authenticateToken, async (req, res) => {
   try {
     const db = getDB();
     const rawProxy = { ...req.body };
-    const encryptedPassword = rawProxy.password ? encryptField(rawProxy.password) : rawProxy.password;
     const now = toMySQLDate();
+    const proxyId = rawProxy.id || `proxy-${Date.now()}`;
+
+    // Universal parser guarantees exact verbatim raw_input alongside normalized fields
+    let parsed;
+    try {
+      parsed = parseProxyInput(rawProxy);
+    } catch (parseErr) {
+      return res.status(400).json({ error: `Invalid proxy format: ${parseErr.message}` });
+    }
+
+    const encryptedPassword = parsed.password ? encryptCredential(parsed.password) : null;
     const proxy = {
       ...rawProxy,
-      id: rawProxy.id || `proxy-${Date.now()}`,
+      id: proxyId,
+      host: parsed.host,
+      port: parsed.port,
+      protocol: parsed.protocol,
+      username: parsed.username,
       password: encryptedPassword,
+      raw_input: parsed.raw_input,
       owner_account_id: req.user.id,
       userId: req.user.id,
       created_at: rawProxy.created_at || rawProxy.createdAt || now,
       updated_at: now,
     };
+
     // Anti-poaching check
     const [existing] = await db.query(
       "SELECT id FROM user_proxies WHERE id = ? AND owner_account_id IS NOT NULL AND owner_account_id != ?",
@@ -1315,7 +1957,8 @@ app.post("/api/data/proxies", authenticateToken, async (req, res) => {
     if (existing.length > 0) {
       return res.status(403).json({ error: "Proxy ID belongs to another user account." });
     }
-    // Upsert
+
+    // Upsert to user_proxies and proxies
     await db.query(
       "INSERT INTO user_proxies (id, owner_account_id, userId, document) VALUES (?, ?, ?, ?) ON DUPLICATE KEY UPDATE document = VALUES(document)",
       [proxy.id, req.user.id, req.user.id, JSON.stringify(proxy)]
@@ -1324,7 +1967,59 @@ app.post("/api/data/proxies", authenticateToken, async (req, res) => {
       "INSERT INTO proxies (id, owner_account_id, userId, document) VALUES (?, ?, ?, ?) ON DUPLICATE KEY UPDATE document = VALUES(document)",
       [proxy.id, req.user.id, req.user.id, JSON.stringify(proxy)]
     );
-    res.json({ success: true, proxy: { ...proxy, password: rawProxy.password } });
+
+    // Sync to profile_proxies for admin monitoring
+    await db.query(
+      `INSERT INTO profile_proxies (
+        id, account_id, user_id, profile_id, raw_input, protocol, host, port, username, password_encrypted,
+        source, source_file, source_row, configuration_status, runtime_status, last_connection_status,
+        created_at, updated_at
+      ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'CONFIGURED', 'IDLE', 'NONE', ?, ?)
+      ON DUPLICATE KEY UPDATE
+        raw_input = VALUES(raw_input),
+        protocol = VALUES(protocol),
+        host = VALUES(host),
+        port = VALUES(port),
+        username = VALUES(username),
+        password_encrypted = VALUES(password_encrypted),
+        source = VALUES(source),
+        updated_at = VALUES(updated_at)`,
+      [
+        proxy.id,
+        String(req.user.id),
+        String(req.user.id),
+        parsed.raw_input,
+        parsed.protocol,
+        parsed.host,
+        parsed.port,
+        parsed.username,
+        encryptedPassword,
+        rawProxy.source || "manual",
+        rawProxy.source_file || null,
+        rawProxy.source_row ? parseInt(rawProxy.source_row, 10) : null,
+        now,
+        now,
+      ]
+    );
+
+    // Emit audit event (sanitized: NO credentials, reference proxy_id)
+    await emitProxyAuditEvent({
+      accountId: req.user.id,
+      userId: req.user.id,
+      proxyId: proxy.id,
+      eventType: "proxy_added",
+      source: rawProxy.source || "manual",
+      status: "CONFIGURED",
+      metadata: {
+        host: parsed.host,
+        port: parsed.port,
+        protocol: parsed.protocol,
+      },
+      ip: req.ip || req.socket.remoteAddress || "",
+      userAgent: req.headers["user-agent"] || "",
+    });
+
+    res.json({ success: true, proxy: { ...proxy, password: parsed.password } });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -1342,10 +2037,25 @@ app.delete("/api/data/proxies/:id", authenticateToken, async (req, res) => {
       "DELETE FROM proxies WHERE id = ? AND (owner_account_id = ? OR userId = ?)",
       [proxyId, req.user.id, req.user.id]
     );
+    await db.query(
+      "DELETE FROM profile_proxies WHERE id = ? AND (account_id = ? OR user_id = ?)",
+      [proxyId, req.user.id, req.user.id]
+    );
     if (result.affectedRows === 0) {
       return res.status(404).json({ error: "Proxy not found or access denied." });
     }
     await recordAuditLog(req.user.id, req.user.email, "proxy_deleted", proxyId, { proxyId });
+    await emitProxyAuditEvent({
+      accountId: req.user.id,
+      userId: req.user.id,
+      proxyId,
+      eventType: "proxy_removed",
+      source: "manual",
+      status: "REMOVED",
+      metadata: { proxy_id: proxyId },
+      ip: req.ip || req.socket.remoteAddress || "",
+      userAgent: req.headers["user-agent"] || "",
+    });
     res.json({ success: true, deletedCount: result.affectedRows });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1568,7 +2278,10 @@ export function stopServer() {
   }
 }
 
-start();
+const isDirectRun = process.argv[1] && (process.argv[1].endsWith("index.js") || process.argv[1].endsWith("index.mjs"));
+if (isDirectRun && process.env.NODE_ENV !== "test") {
+  start();
+}
 
-export { app };
+export { app, start };
 export default app;

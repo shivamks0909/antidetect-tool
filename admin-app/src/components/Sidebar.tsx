@@ -1,10 +1,10 @@
 import React from "react";
-import { LayoutDashboard, Users, ShieldAlert, Settings, LogOut, CheckCircle2, ShieldCheck } from "lucide-react";
+import { LayoutDashboard, Users, ShieldAlert, Settings, LogOut, CheckCircle2, ShieldCheck, Globe } from "lucide-react";
 import { setAuthToken } from "../api/client";
 
 interface SidebarProps {
-  activePage: "dashboard" | "users" | "audit" | "security" | "settings";
-  setActivePage: (page: "dashboard" | "users" | "audit" | "security" | "settings") => void;
+  activePage: "dashboard" | "users" | "audit" | "security" | "proxies" | "settings";
+  setActivePage: (page: "dashboard" | "users" | "audit" | "security" | "proxies" | "settings") => void;
   onLogout: () => void;
   currentUserEmail?: string;
   mongoStatus?: string;
@@ -75,6 +75,18 @@ export function Sidebar({ activePage, setActivePage, onLogout, currentUserEmail,
         >
           <ShieldCheck className="w-4 h-4" />
           Security & 2FA
+        </button>
+
+        <button
+          onClick={() => setActivePage("proxies")}
+          className={`w-full flex items-center gap-3 px-3.5 py-2.5 rounded-xl font-semibold text-sm transition-all ${
+            activePage === "proxies"
+              ? "bg-green-600 text-white shadow-lg shadow-green-600/20"
+              : "text-slate-400 hover:text-slate-100 hover:bg-slate-800/50"
+          }`}
+        >
+          <Globe className="w-4 h-4" />
+          Proxy Monitor
         </button>
 
         <button

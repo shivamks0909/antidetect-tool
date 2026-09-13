@@ -8,23 +8,51 @@ import { Dashboard } from "./pages/Dashboard";
 import { Users } from "./pages/Users";
 import { SecuritySettings } from "./pages/SecuritySettings";
 import { AuditLogs } from "./pages/AuditLogs";
+import { ProxyMonitor } from "./pages/ProxyMonitor";
 import { Settings } from "./pages/Settings";
 import { UserPlus } from "lucide-react";
 import { CreateUserModal } from "./components/CreateUserModal";
 
+const VALID_PAGES = ["dashboard", "users", "security", "proxies", "audit", "settings"] as const;
+type PageType = (typeof VALID_PAGES)[number];
+
+function getInitialPage(): PageType {
+  const hash = window.location.hash.replace("#", "").toLowerCase() as PageType;
+  return VALID_PAGES.includes(hash) ? hash : "dashboard";
+}
+
 export function App() {
   const [isAuthenticated, setIsAuthenticated] = useState<boolean>(false);
   const [currentUser, setCurrentUser] = useState<UserItem | null>(null);
-  const [activePage, setActivePage] = useState<"dashboard" | "users" | "security" | "audit" | "settings">("dashboard");
+  const [activePage, setActivePageState] = useState<PageType>(getInitialPage());
   const [showForgotPassword, setShowForgotPassword] = useState<boolean>(false);
 
   const [users, setUsers] = useState<UserItem[]>([]);
+  const [usersLoading, setUsersLoading] = useState<boolean>(false);
+  const [usersError, setUsersError] = useState<string | null>(null);
+
   const [auditLogs, setAuditLogs] = useState<AuditLogItem[]>([]);
   const [health, setHealth] = useState<HealthStatus | null>(null);
   const [loading, setLoading] = useState<boolean>(true);
   const [showGlobalCreateModal, setShowGlobalCreateModal] = useState<boolean>(false);
 
-  const checkAuth = async () => {
+  const setActivePage = (page: PageType) => {
+    setActivePageState(page);
+    window.location.hash = page;
+  };
+
+  useEffect(() => {
+    const onHashChange = () => {
+      const page = window.location.hash.replace("#", "").toLowerCase() as PageType;
+      if (VALID_PAGES.includes(page)) {
+        setActivePageState(page);
+      }
+    };
+    window.addEventListener("hashchange", onHashChange);
+    return () => window.removeEventListener("hashchange", onHashChange);
+  }, []);
+
+  const checkAuth = async (isRetry = false) => {
     const token = getAuthToken();
     if (!token) {
       setIsAuthenticated(false);
@@ -35,33 +63,75 @@ export function App() {
     try {
       const user = await api.getMe();
       if (user.role !== "admin") {
+        api.logout();
+        setCurrentUser(null);
         setIsAuthenticated(false);
         setLoading(false);
         return;
       }
       setCurrentUser(user);
       setIsAuthenticated(true);
-    } catch {
-      setIsAuthenticated(false);
+    } catch (err: any) {
+      console.warn("[Auth Bootstrap] Validation check failed:", err.message);
+      const isExplicitAuthFailure =
+        err.message &&
+        (err.message.includes("401") ||
+          err.message.includes("403") ||
+          err.message.includes("expired") ||
+          err.message.includes("revoked"));
+
+      if (isExplicitAuthFailure) {
+        api.logout();
+        setCurrentUser(null);
+        setIsAuthenticated(false);
+      } else if (!isRetry) {
+        // Cold-start / serverless retry
+        await new Promise((r) => setTimeout(r, 600));
+        return checkAuth(true);
+      } else {
+        setIsAuthenticated(false);
+      }
     } finally {
       setLoading(false);
     }
   };
 
+  const fetchUsers = async () => {
+    setUsersLoading(true);
+    setUsersError(null);
+    try {
+      const uData = await api.getUsers();
+      setUsers(uData.users || []);
+    } catch (err: any) {
+      console.error("[Users] Fetch failed:", err.message);
+      setUsersError(err.message || "Failed to load users");
+    } finally {
+      setUsersLoading(false);
+    }
+  };
+
   const refreshData = async () => {
     if (!isAuthenticated) return;
+    fetchUsers();
     try {
-      const [uData, aData, hData] = await Promise.all([
-        api.getUsers().catch(() => ({ users: [] })),
+      const [aData, hData] = await Promise.all([
         api.getAuditLogs().catch(() => ({ logs: [] })),
         api.getHealth(),
       ]);
-
-      setUsers(uData.users || []);
       setAuditLogs(aData.logs || []);
       setHealth(hData);
     } catch (err) {
       console.error("Failed to refresh admin data:", err);
+    }
+  };
+
+  const handleLogout = async () => {
+    try {
+      await api.logout();
+    } finally {
+      setCurrentUser(null);
+      setIsAuthenticated(false);
+      window.location.hash = "";
     }
   };
 
@@ -105,7 +175,7 @@ export function App() {
       <Sidebar
         activePage={activePage}
         setActivePage={setActivePage}
-        onLogout={() => setIsAuthenticated(false)}
+        onLogout={handleLogout}
         currentUserEmail={currentUser?.email}
         mongoStatus={health?.mongodb}
       />
@@ -119,6 +189,8 @@ export function App() {
               ? "User & Access Control"
               : activePage === "security"
               ? "Security & 2FA"
+              : activePage === "proxies"
+              ? "Proxy Fleet & Usage Monitor"
               : activePage === "audit"
               ? "Security Audit Trail"
               : "System Infrastructure"
@@ -130,6 +202,8 @@ export function App() {
               ? "Create, search, filter, disable, reset password, and edit users"
               : activePage === "security"
               ? "Manage admin password policy, authenticator TOTP 2FA, and active login sessions"
+              : activePage === "proxies"
+              ? "Verbatim raw proxy format preservation, runtime lifecycle telemetry, and audited credential access"
               : activePage === "audit"
               ? "Live logs captured directly from REST API operations"
               : "MongoDB Atlas cluster and backend service status"
@@ -159,9 +233,18 @@ export function App() {
             />
           )}
 
-          {activePage === "users" && <Users users={users} onRefresh={refreshData} />}
+          {activePage === "users" && (
+            <Users
+              users={users}
+              isLoading={usersLoading}
+              error={usersError}
+              onRefresh={fetchUsers}
+            />
+          )}
 
           {activePage === "security" && <SecuritySettings />}
+
+          {activePage === "proxies" && <ProxyMonitor />}
 
           {activePage === "audit" && <AuditLogs logs={auditLogs} onRefresh={refreshData} />}
 
