@@ -1,13 +1,16 @@
 export type ProxyEntry = {
   id: string;
   name: string;
-  kind: "socks5" | "http" | "https";
+  kind: "socks5" | "http" | "https" | "geolocation";
   host: string;
   port: number;
   username: string;
   password: string;
   country: string;
   notes: string;
+  location_label?: string;
+  raw_input?: string;
+  scheme?: string;
 };
 
 export type ProxyTestSnapshot = {

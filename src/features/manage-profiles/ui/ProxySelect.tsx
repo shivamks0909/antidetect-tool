@@ -6,11 +6,17 @@ import { toast } from "../../../shared/model/toast";
 import { proxyBulkParse, proxySave, type ProxyEntry } from "../../../entities/proxy";
 import { useProfile } from "../../../entities/profile";
 import { storeBus } from "../../../shared/lib/storeBus";
+import { parseProxyInput } from "../../../shared/lib/proxyParser";
 
-const label = (p: ProxyEntry) =>
-  p.name && p.name !== `${p.host}:${p.port}`
-    ? `${p.name} · ${p.host}:${p.port}${p.country ? ` · ${p.country}` : ""}`
-    : `${p.host}:${p.port} · ${p.country || p.kind}`;
+const label = (p: ProxyEntry) => {
+  const loc = p.location_label || p.country;
+  if (p.kind === "geolocation") {
+    return `${loc ? `[GEO] ${loc}` : "[GEO] Geolocation"} · ${p.host}:${p.port}`;
+  }
+  return p.name && p.name !== `${p.host}:${p.port}`
+    ? `${p.name} · ${p.host}:${p.port}${loc ? ` · ${loc}` : ""}`
+    : `${p.host}:${p.port} · ${loc || p.kind}`;
+};
 
 type Coords = { left: number; width: number; top?: number; bottom?: number; maxHeight: number };
 
@@ -209,18 +215,36 @@ function CreatePanel({ onCancel, onCreated }: {
   const [busy, setBusy] = useState(false);
   const reloadProfiles = useProfile((s) => s.reload);
 
-  // Parsed as you type, so the preview says what was understood before
-  // anything is saved. Debounced — each attempt is a round trip into Rust.
+  // Parsed as you type with instant local auto-detect and Rust fallback
   useEffect(() => {
     const text = line.trim();
     if (!text) { setParsed(null); return; }
-    let alive = true;
-    const t = setTimeout(() => {
-      proxyBulkParse(text, "socks5")
-        .then((rows) => { if (alive) setParsed(rows[0] ?? null); })
-        .catch(() => { if (alive) setParsed(null); });
-    }, 180);
-    return () => { alive = false; clearTimeout(t); };
+    try {
+      const p = parseProxyInput(text, "socks5");
+      const kind = (p.scheme === "geolocation" ? "geolocation" : p.protocol) as ProxyEntry["kind"];
+      setParsed({
+        id: `proxy-inline-${Date.now()}`,
+        name: p.location_label ? `${p.location_label} (${p.host}:${p.port})` : `${p.host}:${p.port}`,
+        kind,
+        host: p.host,
+        port: p.port,
+        username: p.username || "",
+        password: p.password || "",
+        country: p.location_label || "",
+        location_label: p.location_label || undefined,
+        raw_input: p.raw_input,
+        scheme: p.scheme,
+        notes: p.location_label ? `Location: ${p.location_label}` : "",
+      });
+    } catch {
+      let alive = true;
+      const t = setTimeout(() => {
+        proxyBulkParse(text, "socks5")
+          .then((rows) => { if (alive) setParsed(rows[0] ?? null); })
+          .catch(() => { if (alive) setParsed(null); });
+      }, 180);
+      return () => { alive = false; clearTimeout(t); };
+    }
   }, [line]);
 
   const save = async () => {
@@ -240,6 +264,12 @@ function CreatePanel({ onCancel, onCreated }: {
 
   return (
     <div className="flex flex-col gap-2 p-2">
+      <div className="flex items-center justify-between px-0.5 text-paragraph-xs font-semibold text-text-sub-600">
+        <span>Proxy String</span>
+        <span className="rounded bg-primary-alpha-10 px-1.5 py-0.5 text-[10px] font-bold text-primary-base">
+          Auto Detect
+        </span>
+      </div>
       <Input
         autoFocus
         inputSize="small"
@@ -249,21 +279,40 @@ function CreatePanel({ onCancel, onCreated }: {
         onKeyDown={(e) => {
           if (e.key === "Enter" && parsed && !busy) { e.preventDefault(); void save(); }
         }}
-        placeholder="host:port:user:pass #facebook"
+        placeholder="geolocation://user:pass@host:port:Location or host:port"
       />
-      <div className="min-h-[34px] rounded-8 bg-bg-weak-50 px-2.5 py-1.5 text-paragraph-xs ring-1 ring-inset ring-stroke-soft-200">
+      <div className="min-h-[42px] rounded-8 bg-bg-weak-50 px-2.5 py-2 text-paragraph-xs ring-1 ring-inset ring-stroke-soft-200">
         {parsed ? (
-          <span className="text-text-sub-600">
-            <strong className="text-text-strong-950">{parsed.name}</strong>
-            {" · "}
-            {parsed.kind.toUpperCase()} {parsed.host}:{parsed.port}
-            {parsed.username && ` · ${parsed.username}`}
-          </span>
+          parsed.kind === "geolocation" ? (
+            <div className="flex flex-col gap-1">
+              <div className="flex items-center gap-1.5 font-bold text-emerald-600">
+                <span className="inline-block h-2 w-2 rounded-full bg-emerald-500 animate-pulse" />
+                Detected: Geolocation Proxy
+              </div>
+              <div className="grid grid-cols-2 gap-x-2 gap-y-0.5 font-mono text-text-sub-600">
+                <div><span className="text-text-soft-400">Host:</span> {parsed.host}</div>
+                <div><span className="text-text-soft-400">Port:</span> {parsed.port}</div>
+                {parsed.location_label && (
+                  <div className="col-span-2"><span className="text-text-soft-400">Location:</span> <strong className="font-sans font-bold text-text-strong-950">{parsed.location_label}</strong></div>
+                )}
+                {parsed.username && (
+                  <div className="col-span-2 truncate"><span className="text-text-soft-400">User:</span> {parsed.username}</div>
+                )}
+              </div>
+            </div>
+          ) : (
+            <span className="text-text-sub-600">
+              <strong className="text-text-strong-950">{parsed.name}</strong>
+              {" · "}
+              {parsed.kind.toUpperCase()} {parsed.host}:{parsed.port}
+              {parsed.username && ` · ${parsed.username}`}
+            </span>
+          )
         ) : (
           <span className="text-text-soft-400">
             {line.trim()
-              ? "Not a proxy line — check the host and port."
-              : "Paste a line: host:port, host:port:user:pass, user:pass@host:port, or a socks5:// URL."}
+              ? "Not a valid proxy string — check host, port, or geolocation format."
+              : "Paste a proxy: geolocation://user:pass@host:port:location, host:port, or socks5://."}
           </span>
         )}
       </div>

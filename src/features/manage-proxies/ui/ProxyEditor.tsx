@@ -93,9 +93,15 @@ export function ProxyEditor({ initial, onClose, onSaved }: {
               { value: "socks5", label: "SOCKS5" },
               { value: "http", label: "HTTP" },
               { value: "https", label: "HTTPS" },
+              { value: "geolocation", label: "Geolocation" },
             ]}
           />
-          <Field label="Country" value={p.country} onChange={(v: string) => setP({ ...p, country: v })} />
+          <Field
+            label={p.kind === "geolocation" ? "Location Label" : "Country"}
+            value={p.location_label || p.country}
+            onChange={(v: string) => setP({ ...p, country: v, location_label: v })}
+            placeholder={p.kind === "geolocation" ? "e.g. United States - 54" : "e.g. US"}
+          />
         </div>
         <div className="grid grid-cols-2 gap-3">
           <Field label="Host" value={p.host} onChange={(v: string) => setP({ ...p, host: v })} />

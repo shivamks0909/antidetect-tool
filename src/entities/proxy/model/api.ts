@@ -1,5 +1,6 @@
 import { safeInvoke } from "../../../shared/lib/tauriHelper";
 import type { ProxyEntry, ProxyTestSnapshot } from "./types";
+import { parseProxyInput } from "../../../shared/lib/proxyParser";
 
 const MOCK_PROXIES_KEY = "oi_mock_proxies";
 
@@ -74,60 +75,27 @@ const mockProxyBulkParse = (text: string, defaultKind: ProxyEntry["kind"]): Prox
     const main = hashIdx >= 0 ? line.slice(0, hashIdx).trim() : line;
     const comment = hashIdx >= 0 ? line.slice(hashIdx + 1).trim() : "";
 
-    let kind: ProxyEntry["kind"] = defaultKind;
-    let rest = main;
-    const lower = main.toLowerCase();
-    if (lower.startsWith("socks5://")) { kind = "socks5"; rest = main.slice(9); }
-    else if (lower.startsWith("https://")) { kind = "https"; rest = main.slice(8); }
-    else if (lower.startsWith("http://")) { kind = "http"; rest = main.slice(7); }
-
-    let host = "", port = 1080, username = "", password = "";
-    if (rest.includes("@")) {
-      const [u, hp] = rest.split("@");
-      const [un, pw] = (u || "").split(":");
-      username = un || "";
-      password = pw || "";
-      const [h, p] = (hp || "").split(":");
-      host = h || "";
-      port = parseInt(p, 10) || 1080;
-    } else {
-      const parts = rest.split(":");
-      if (parts.length === 2) {
-        host = parts[0];
-        port = parseInt(parts[1], 10) || 1080;
-      } else if (parts.length === 4) {
-        const p1 = parseInt(parts[1], 10);
-        const p3 = parseInt(parts[3], 10);
-        if (!isNaN(p1) && p1 > 0 && p1 <= 65535) {
-          host = parts[0];
-          port = p1;
-          username = parts[2];
-          password = parts[3];
-        } else if (!isNaN(p3) && p3 > 0 && p3 <= 65535) {
-          username = parts[0];
-          password = parts[1];
-          host = parts[2];
-          port = p3;
-        } else {
-          continue;
-        }
-      } else {
-        continue;
-      }
+    try {
+      const parsed = parseProxyInput(main, defaultKind);
+      const id = `proxy-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
+      const kind = (parsed.scheme === "geolocation" ? "geolocation" : parsed.protocol) as ProxyEntry["kind"];
+      result.push({
+        id,
+        name: comment || (parsed.location_label ? `${parsed.location_label} (${parsed.host}:${parsed.port})` : `${parsed.host}:${parsed.port}`),
+        kind,
+        host: parsed.host,
+        port: parsed.port,
+        username: parsed.username || "",
+        password: parsed.password || "",
+        country: parsed.location_label || "",
+        location_label: parsed.location_label || undefined,
+        raw_input: parsed.raw_input,
+        scheme: parsed.scheme,
+        notes: comment ? `# ${comment}` : (parsed.location_label ? `Location: ${parsed.location_label}` : ""),
+      });
+    } catch (_) {
+      continue;
     }
-    if (!host) continue;
-    const id = `proxy-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
-    result.push({
-      id,
-      name: comment || `${host}:${port}`,
-      kind,
-      host,
-      port,
-      username,
-      password,
-      country: "",
-      notes: comment ? `# ${comment}` : "",
-    });
   }
   return result;
 };

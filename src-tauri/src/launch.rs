@@ -348,7 +348,7 @@ pub async fn launch_profile_synced(
                 // Chrome ignores user:pass in --proxy-server for HTTP(S) and shows a
                 // native popup instead — this handler answers auth challenges silently.
                 if let Some(p) = bound_proxy.as_ref() {
-                    if p.has_credentials() && matches!(p.kind, proxy::ProxyKind::Http | proxy::ProxyKind::Https) {
+                    if p.has_credentials() && matches!(p.kind, proxy::ProxyKind::Http | proxy::ProxyKind::Https | proxy::ProxyKind::Geolocation) {
                         eprintln!("[launcher] spawning proxy auth handler for {}:{}", p.host, p.port);
                         proxy::spawn_proxy_auth_handler(c.web_socket_debugger_url.clone(), p.clone());
                     }

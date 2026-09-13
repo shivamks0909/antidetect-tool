@@ -150,6 +150,8 @@ pub async fn import_order_proxies(order_id: i64, kind: String) -> Result<usize> 
             password: s(&it, "password"),
             country: String::new(),
             notes: format!("ProxyShard order {order_id}"),
+            location_label: None,
+            raw_input: None,
         });
     }
 

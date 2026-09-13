@@ -593,6 +593,7 @@ async fn add_proxy(Json(body): Json<AddProxyReq>) -> ApiResult {
         let kind = match body.kind.as_deref() {
             Some("http") => crate::proxy::ProxyKind::Http,
             Some("https") => crate::proxy::ProxyKind::Https,
+            Some("geolocation") => crate::proxy::ProxyKind::Geolocation,
             _ => crate::proxy::ProxyKind::Socks5,
         };
         crate::proxy::ProxyEntry {
@@ -605,6 +606,8 @@ async fn add_proxy(Json(body): Json<AddProxyReq>) -> ApiResult {
             password: body.password.clone().unwrap_or_default(),
             country: String::new(),
             notes: String::new(),
+            location_label: None,
+            raw_input: None,
         }
     };
     // metadata overrides (applied to parsed entries too).

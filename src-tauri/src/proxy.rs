@@ -12,6 +12,7 @@ pub enum ProxyKind {
     Socks5,
     Http,
     Https,
+    Geolocation,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -32,18 +33,22 @@ pub struct ProxyEntry {
     /// Free-form note.
     #[serde(default)]
     pub notes: String,
+    #[serde(default)]
+    pub location_label: Option<String>,
+    #[serde(default)]
+    pub raw_input: Option<String>,
 }
 
 impl ProxyEntry {
     /// Build `--proxy-server=<scheme>://[user:pass@]host:port`.
     /// SOCKS5: credentials embedded in URL (Chromium handles natively).
-    /// HTTP/HTTPS: credentials stripped — use CDP Fetch domain for auth
+    /// HTTP/HTTPS/Geolocation: credentials stripped — use CDP Fetch domain for auth
     /// (Chrome ignores user:pass in --proxy-server URL for HTTP(S) proxies
     /// and shows a native auth popup instead).
     pub fn to_proxy_server_arg(&self) -> String {
         let scheme = match self.kind {
             ProxyKind::Socks5 => "socks5",
-            ProxyKind::Http => "http",
+            ProxyKind::Http | ProxyKind::Geolocation => "http",
             ProxyKind::Https => "https",
         };
         let host_port = format!("{}:{}", self.host, self.port);
@@ -266,7 +271,7 @@ pub async fn probe(entry: &ProxyEntry) -> Result<u128> {
                 }
             }
         }
-        ProxyKind::Http | ProxyKind::Https => {
+        ProxyKind::Http | ProxyKind::Https | ProxyKind::Geolocation => {
             // CONNECT with Basic auth; read until CRLFCRLF to avoid clipping headers.
             use base64::{engine::general_purpose::STANDARD, Engine as _};
             let mut req = String::from(
@@ -338,6 +343,34 @@ fn parse_one(line: &str, default_kind: &ProxyKind) -> Option<ProxyEntry> {
         None => (line, None),
     };
     let lower_main = main.to_lowercase();
+    if lower_main.starts_with("geolocation://") {
+        let after_scheme = &main[14..];
+        let (auth, rest_hp) = after_scheme.split_once('@')?;
+        let (user, pass) = auth.split_once(':')?;
+        let (host, remainder) = rest_hp.split_once(':')?;
+        let (port_s, location_label) = remainder.split_once(':')?;
+        let port: u16 = port_s.trim().parse().ok()?;
+        let loc = location_label.trim().to_string();
+        let name = if let Some(c) = comment {
+            c.to_string()
+        } else {
+            format!("{loc} ({host}:{port})")
+        };
+        return Some(ProxyEntry {
+            id: uuid::Uuid::new_v4().to_string(),
+            name,
+            kind: ProxyKind::Geolocation,
+            host: host.trim().to_string(),
+            port,
+            username: user.trim().to_string(),
+            password: pass.to_string(),
+            country: loc.clone(),
+            notes: format!("Location: {loc}"),
+            location_label: Some(loc),
+            raw_input: Some(line.to_string()),
+        });
+    }
+
     let (kind, rest) = if lower_main.starts_with("socks5://") {
         (ProxyKind::Socks5, &main[9..])
     } else if lower_main.starts_with("https://") {
@@ -406,6 +439,8 @@ fn parse_one(line: &str, default_kind: &ProxyKind) -> Option<ProxyEntry> {
         password: pass,
         country,
         notes,
+        location_label: None,
+        raw_input: Some(line.to_string()),
     })
 }
 
@@ -593,7 +628,7 @@ pub async fn geo_check_via(entry: Option<&ProxyEntry>, provider_override: Option
     if let Some(entry) = entry {
         let scheme = match entry.kind {
             ProxyKind::Socks5 => "socks5h", // DNS via proxy
-            ProxyKind::Http => "http",
+            ProxyKind::Http | ProxyKind::Geolocation => "http",
             ProxyKind::Https => "https",
         };
         let proxy_url = if entry.username.is_empty() && entry.password.is_empty() {

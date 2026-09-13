@@ -1169,6 +1169,7 @@ fn proxy_bulk_import(text: String, kind: String) -> Result<usize, String> {
     let default_kind = match kind.as_str() {
         "http" => proxy::ProxyKind::Http,
         "https" => proxy::ProxyKind::Https,
+        "geolocation" => proxy::ProxyKind::Geolocation,
         _ => proxy::ProxyKind::Socks5,
     };
     let parsed = proxy::parse_bulk(&text, default_kind);
@@ -1183,6 +1184,7 @@ fn proxy_bulk_parse(text: String, kind: String) -> Vec<proxy::ProxyEntry> {
     let default_kind = match kind.as_str() {
         "http" => proxy::ProxyKind::Http,
         "https" => proxy::ProxyKind::Https,
+        "geolocation" => proxy::ProxyKind::Geolocation,
         _ => proxy::ProxyKind::Socks5,
     };
     proxy::parse_bulk(&text, default_kind)

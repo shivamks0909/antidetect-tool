@@ -7,6 +7,7 @@ import type {
 } from "./types";
 import type { ProxyEntry } from "../../../entities/proxy";
 import type { ExtensionEntry, ExtensionSet } from "../../../entities/extension";
+import { parseProxyInput } from "../../../shared/lib/proxyParser";
 
 export interface BatchValidationOptions {
   extensionConfig?: BatchExtensionConfig;
@@ -399,68 +400,34 @@ function parseAndValidateProxy(input: ProxyParseInput): { proxy?: ProxyEntry; er
   let port = 1080;
   let username = "";
   let password = "";
+  let location_label: string | undefined = undefined;
+  let raw_input: string | undefined = undefined;
 
   // Normalize kind
   if (input.kind) {
     const k = input.kind.toLowerCase().trim();
-    if (k === "http" || k === "https" || k === "socks5") {
+    if (k === "http" || k === "https" || k === "socks5" || k === "geolocation") {
       kind = k as ProxyEntry["kind"];
     } else if (k === "socks4") {
       kind = "socks5";
     } else {
-      return { error: `Unsupported proxy protocol: "${input.kind}" (must be http, https, or socks5).` };
+      return { error: `Unsupported proxy protocol: "${input.kind}" (must be http, https, socks5, or geolocation).` };
     }
   }
 
-  // 1. If combined raw string is provided, parse it
+  // 1. If combined raw string is provided, parse it with Universal Proxy Parser
   if (input.raw && input.raw.trim().length > 0) {
-    let raw = input.raw.trim();
-    const lower = raw.toLowerCase();
-
-    if (lower.startsWith("socks5://")) { kind = "socks5"; raw = raw.slice(9); }
-    else if (lower.startsWith("socks4://")) { kind = "socks5"; raw = raw.slice(9); }
-    else if (lower.startsWith("https://")) { kind = "https"; raw = raw.slice(8); }
-    else if (lower.startsWith("http://")) { kind = "http"; raw = raw.slice(7); }
-
-    // Strip trailing comments e.g. #myproxy
-    const hashIdx = raw.indexOf("#");
-    if (hashIdx >= 0) raw = raw.slice(0, hashIdx).trim();
-
-    if (raw.includes("@")) {
-      // user:pass@host:port
-      const [u, hp] = raw.split("@");
-      const [un, pw] = (u || "").split(":");
-      username = un || "";
-      password = pw || "";
-      const [h, p] = (hp || "").split(":");
-      host = h || "";
-      port = parseInt(p || "0", 10);
-    } else {
-      const parts = raw.split(":");
-      if (parts.length === 2) {
-        // host:port
-        host = parts[0];
-        port = parseInt(parts[1] || "0", 10);
-      } else if (parts.length === 4) {
-        // host:port:user:pass OR user:pass:host:port
-        const p1 = parseInt(parts[1], 10);
-        const p3 = parseInt(parts[3], 10);
-        if (!isNaN(p1) && p1 > 0 && p1 <= 65535) {
-          host = parts[0];
-          port = p1;
-          username = parts[2] || "";
-          password = parts[3] || "";
-        } else if (!isNaN(p3) && p3 > 0 && p3 <= 65535) {
-          username = parts[0] || "";
-          password = parts[1] || "";
-          host = parts[2];
-          port = p3;
-        } else {
-          return { error: `Invalid proxy format "${input.raw}". Expected host:port or host:port:user:pass.` };
-        }
-      } else {
-        return { error: `Invalid proxy string "${input.raw}". Could not extract host and port.` };
-      }
+    try {
+      const parsed = parseProxyInput(input.raw.trim(), input.kind || "socks5");
+      host = parsed.host;
+      port = parsed.port;
+      username = parsed.username || "";
+      password = parsed.password || "";
+      raw_input = parsed.raw_input;
+      location_label = parsed.location_label || undefined;
+      kind = (parsed.scheme === "geolocation" ? "geolocation" : (parsed.protocol as ProxyEntry["kind"])) || kind;
+    } catch (err: any) {
+      return { error: `Invalid proxy format "${input.raw}": ${err.message}` };
     }
   } else if (input.host) {
     // 2. Discrete fields provided
@@ -468,6 +435,7 @@ function parseAndValidateProxy(input: ProxyParseInput): { proxy?: ProxyEntry; er
     port = parseInt(input.port || "1080", 10);
     username = input.user || "";
     password = input.pass || "";
+    raw_input = `${host}:${port}`;
   }
 
   // Validate Host
@@ -481,19 +449,27 @@ function parseAndValidateProxy(input: ProxyParseInput): { proxy?: ProxyEntry; er
   }
 
   const proxyId = `proxy-batch-${Date.now()}-${Math.random().toString(36).substring(2, 8)}`;
-  const proxyName = `${input.rowTitle} Proxy (${host}:${port})`;
+  const displayName = location_label
+    ? `${location_label} (${host}:${port})`
+    : `${input.rowTitle} Proxy (${host}:${port})`;
 
   return {
     proxy: {
       id: proxyId,
-      name: proxyName,
+      name: displayName,
       kind,
       host,
       port,
       username,
       password,
-      country: "",
-      notes: input.rotateUrl ? `Rotate IP URL: ${input.rotateUrl}` : "Imported via Batch Provisioning",
+      country: location_label || "",
+      location_label,
+      raw_input: raw_input || `${host}:${port}`,
+      notes: input.rotateUrl
+        ? `Rotate IP URL: ${input.rotateUrl}`
+        : location_label
+        ? `Location: ${location_label}`
+        : "Imported via Batch Provisioning",
     },
   };
 }

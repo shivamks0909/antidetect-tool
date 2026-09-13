@@ -58,6 +58,7 @@ export interface ProxyMonitorItem {
   username: string | null;
   password_masked: string | null;
   has_password: boolean;
+  location_label?: string | null;
   source: string;
   source_file: string | null;
   source_row: number | null;

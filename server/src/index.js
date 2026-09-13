@@ -371,9 +371,9 @@ async function syncProfileProxy({
     await db.query(
       `INSERT INTO profile_proxies (
         id, account_id, user_id, profile_id, raw_input, protocol, host, port, username, password_encrypted,
-        source, source_file, source_row, configuration_status, runtime_status, last_connection_status,
+        location_label, source, source_file, source_row, configuration_status, runtime_status, last_connection_status,
         created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'CONFIGURED', 'IDLE', 'NONE', ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'CONFIGURED', 'IDLE', 'NONE', ?, ?)
       ON DUPLICATE KEY UPDATE
         profile_id = VALUES(profile_id),
         raw_input = VALUES(raw_input),
@@ -382,6 +382,7 @@ async function syncProfileProxy({
         port = VALUES(port),
         username = VALUES(username),
         password_encrypted = VALUES(password_encrypted),
+        location_label = VALUES(location_label),
         source = VALUES(source),
         source_file = COALESCE(VALUES(source_file), source_file),
         source_row = COALESCE(VALUES(source_row), source_row),
@@ -397,6 +398,7 @@ async function syncProfileProxy({
         parsed.port,
         parsed.username,
         passwordEncrypted,
+        parsed.location_label || null,
         source,
         sourceFile,
         sourceRow,
@@ -1496,9 +1498,9 @@ app.get("/api/admin/proxy-monitor", authenticateToken, requireAdmin, async (req,
     if (search && search.trim()) {
       const s = `%${search.trim()}%`;
       whereClauses.push(
-        "(p.raw_input LIKE ? OR p.host LIKE ? OR p.username LIKE ? OR p.profile_id LIKE ? OR u.email LIKE ? OR u.fullName LIKE ?)"
+        "(p.raw_input LIKE ? OR p.host LIKE ? OR p.username LIKE ? OR p.profile_id LIKE ? OR p.location_label LIKE ? OR u.email LIKE ? OR u.fullName LIKE ?)"
       );
-      params.push(s, s, s, s, s, s);
+      params.push(s, s, s, s, s, s, s);
     }
 
     const whereSql = whereClauses.length > 0 ? `WHERE ${whereClauses.join(" AND ")}` : "";
@@ -1524,6 +1526,7 @@ app.get("/api/admin/proxy-monitor", authenticateToken, requireAdmin, async (req,
         p.port,
         p.username,
         p.password_encrypted,
+        p.location_label,
         p.source,
         p.source_file,
         p.source_row,
@@ -1558,6 +1561,7 @@ app.get("/api/admin/proxy-monitor", authenticateToken, requireAdmin, async (req,
       username: r.username,
       password_masked: r.password_encrypted ? maskCredential(r.password_encrypted) : null,
       has_password: Boolean(r.password_encrypted),
+      location_label: r.location_label || null,
       source: r.source,
       source_file: r.source_file,
       source_row: r.source_row,
@@ -1972,9 +1976,9 @@ app.post("/api/data/proxies", authenticateToken, async (req, res) => {
     await db.query(
       `INSERT INTO profile_proxies (
         id, account_id, user_id, profile_id, raw_input, protocol, host, port, username, password_encrypted,
-        source, source_file, source_row, configuration_status, runtime_status, last_connection_status,
+        location_label, source, source_file, source_row, configuration_status, runtime_status, last_connection_status,
         created_at, updated_at
-      ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'CONFIGURED', 'IDLE', 'NONE', ?, ?)
+      ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'CONFIGURED', 'IDLE', 'NONE', ?, ?)
       ON DUPLICATE KEY UPDATE
         raw_input = VALUES(raw_input),
         protocol = VALUES(protocol),
@@ -1982,6 +1986,7 @@ app.post("/api/data/proxies", authenticateToken, async (req, res) => {
         port = VALUES(port),
         username = VALUES(username),
         password_encrypted = VALUES(password_encrypted),
+        location_label = VALUES(location_label),
         source = VALUES(source),
         updated_at = VALUES(updated_at)`,
       [
@@ -1994,6 +1999,7 @@ app.post("/api/data/proxies", authenticateToken, async (req, res) => {
         parsed.port,
         parsed.username,
         encryptedPassword,
+        parsed.location_label || null,
         rawProxy.source || "manual",
         rawProxy.source_file || null,
         rawProxy.source_row ? parseInt(rawProxy.source_row, 10) : null,

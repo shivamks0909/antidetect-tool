@@ -200,6 +200,7 @@ CREATE TABLE IF NOT EXISTS profile_proxies (
   port INT NOT NULL,
   username VARCHAR(255) DEFAULT NULL,
   password_encrypted TEXT DEFAULT NULL,
+  location_label VARCHAR(255) DEFAULT NULL,
   source VARCHAR(50) NOT NULL DEFAULT 'manual',
   source_file VARCHAR(255) DEFAULT NULL,
   source_row INT DEFAULT NULL,
@@ -375,6 +376,7 @@ CREATE TABLE IF NOT EXISTS profile_proxies (
   port INTEGER NOT NULL,
   username TEXT DEFAULT NULL,
   password_encrypted TEXT DEFAULT NULL,
+  location_label TEXT DEFAULT NULL,
   source TEXT NOT NULL DEFAULT 'manual',
   source_file TEXT DEFAULT NULL,
   source_row INTEGER DEFAULT NULL,
@@ -414,7 +416,7 @@ function translateSqlForSqlite(sql) {
     if (/system_config/i.test(s)) {
       s = s.replace(/ON DUPLICATE KEY UPDATE[\s\S]*/i, "ON CONFLICT(configKey) DO UPDATE SET manifest = excluded.manifest, updatedAt = excluded.updatedAt, publishedBy = excluded.publishedBy");
     } else if (/profile_proxies/i.test(s)) {
-      s = s.replace(/ON DUPLICATE KEY UPDATE[\s\S]*/i, "ON CONFLICT(id) DO UPDATE SET profile_id = excluded.profile_id, raw_input = excluded.raw_input, protocol = excluded.protocol, host = excluded.host, port = excluded.port, username = excluded.username, password_encrypted = excluded.password_encrypted, source = excluded.source, source_file = excluded.source_file, source_row = excluded.source_row, configuration_status = excluded.configuration_status, runtime_status = excluded.runtime_status, last_connection_status = excluded.last_connection_status, last_used_at = excluded.last_used_at, last_connection_at = excluded.last_connection_at, updated_at = excluded.updated_at");
+      s = s.replace(/ON DUPLICATE KEY UPDATE[\s\S]*/i, "ON CONFLICT(id) DO UPDATE SET profile_id = excluded.profile_id, raw_input = excluded.raw_input, protocol = excluded.protocol, host = excluded.host, port = excluded.port, username = excluded.username, password_encrypted = excluded.password_encrypted, location_label = excluded.location_label, source = excluded.source, source_file = excluded.source_file, source_row = excluded.source_row, configuration_status = excluded.configuration_status, runtime_status = excluded.runtime_status, last_connection_status = excluded.last_connection_status, last_used_at = excluded.last_used_at, last_connection_at = excluded.last_connection_at, updated_at = excluded.updated_at");
     } else {
       const match = s.match(/ON DUPLICATE KEY UPDATE\s+([\s\S]+)$/i);
       if (match) {
@@ -448,6 +450,14 @@ function initSqlite() {
   for (const stmt of statements) {
     sqliteDb.exec(stmt);
   }
+
+  // Ensure location_label column exists in existing profile_proxies table
+  try {
+    const cols = sqliteDb.prepare("PRAGMA table_info(profile_proxies)").all();
+    if (cols && !cols.some(c => c.name === "location_label")) {
+      sqliteDb.exec("ALTER TABLE profile_proxies ADD COLUMN location_label TEXT DEFAULT NULL");
+    }
+  } catch (_) {}
 
   activeEngine = "sqlite";
   console.log(`[Database] Embedded SQLite engine active (${dbFilePath})`);
