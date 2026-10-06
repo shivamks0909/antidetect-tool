@@ -28,8 +28,9 @@ export function SettingsPage() {
     theme: "dark",
     geo_checker: "ip-api.com",
     screen_resolution_mode: "fingerprint",
-    helper_enabled: true,
+    helper_enabled: false,
     helper_triggers: [],
+    minimize_to_tray: false,
     extra_args: "",
     api_enabled: true,
     api_port: 40325,
@@ -244,6 +245,17 @@ export function SettingsPage() {
           label="Substitute the camera"
           checked={s.camera_enabled ?? true}
           onChange={(checked) => setS({ ...s, camera_enabled: checked })}
+        />
+      </SettingsCard>
+
+      <SettingsCard title="Window Behavior">
+        <p className="m-0 mb-2 text-paragraph-xs text-text-soft-400">
+          When turned off, clicking the close (✕) button will cleanly exit the launcher and terminate any lingering browser processes.
+        </p>
+        <Switch
+          label="Minimize to system tray on close"
+          checked={s.minimize_to_tray ?? false}
+          onChange={(checked) => setS({ ...s, minimize_to_tray: checked })}
         />
       </SettingsCard>
 

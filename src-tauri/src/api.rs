@@ -606,6 +606,7 @@ async fn add_proxy(Json(body): Json<AddProxyReq>) -> ApiResult {
             password: body.password.clone().unwrap_or_default(),
             country: String::new(),
             notes: String::new(),
+            source_format: None,
             location_label: None,
             raw_input: None,
         }

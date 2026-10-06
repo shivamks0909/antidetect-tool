@@ -60,6 +60,9 @@ fn paths_for(id: &str) -> Result<(PathBuf, PathBuf)> {
 /// Archive the profile, then delete the original. The archive holds the
 /// profile JSON verbatim plus the kept user-data files under `user-data/`.
 pub fn move_to_trash(id: &str) -> Result<TrashEntry> {
+    // Terminate the profile process if running before reading/locking files
+    let _ = crate::process::Tracker::shared().kill_sync(id);
+
     let stored = profile::load_raw(id)?;
     let (zip_path, meta_path) = paths_for(id)?;
 

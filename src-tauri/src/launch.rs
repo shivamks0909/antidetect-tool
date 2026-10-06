@@ -7,34 +7,109 @@ use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
+/// App name shown in Windows Alt+Tab and taskbar.
+const APP_DISPLAY_NAME: &str = "Opinion Insights Browser";
+
 /// Launch result: OS pid plus CDP endpoint when remote-debugging is on.
 pub struct LaunchOutcome {
     pub pid: u32,
     pub cdp: Option<process::CdpInfo>,
 }
 
-/// Resolve the ShardX executable from settings, runtime cache, or dev guess.
+/// Detect installed official Google Chrome executable on the host system.
+pub fn detect_installed_chrome() -> Option<PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        let mut candidates = vec![
+            PathBuf::from(r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
+            PathBuf::from(r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"),
+        ];
+        if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
+            candidates.push(PathBuf::from(local_app_data).join(r"Google\Chrome\Application\chrome.exe"));
+        }
+        if let Ok(program_files) = std::env::var("ProgramFiles") {
+            candidates.push(PathBuf::from(program_files).join(r"Google\Chrome\Application\chrome.exe"));
+        }
+        for c in candidates {
+            if c.exists() {
+                return Some(c);
+            }
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let candidates = [
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Chrome.app/Contents/MacOS/Chrome",
+        ];
+        for c in &candidates {
+            let pb = PathBuf::from(c);
+            if pb.exists() {
+                return Some(pb);
+            }
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let candidates = [
+            "/usr/bin/google-chrome",
+            "/usr/bin/google-chrome-stable",
+            "/usr/bin/chromium",
+            "/usr/bin/chromium-browser",
+        ];
+        for c in &candidates {
+            let pb = PathBuf::from(c);
+            if pb.exists() {
+                return Some(pb);
+            }
+        }
+    }
+    None
+}
+
+/// Resolve the Chromium or Chrome executable from settings, runtime cache, or dev guess.
 pub fn resolve_binary() -> Result<PathBuf> {
-    if let Some(p) = settings::load()?.browser_path {
+    let app_settings = settings::load()?;
+
+    // If operator selected official Chrome runtime for compatibility testing
+    if app_settings.browser_runtime.as_deref() == Some("chrome") {
+        if let Some(chrome_path) = detect_installed_chrome() {
+            return Ok(chrome_path);
+        }
+        anyhow::bail!("Official Google Chrome runtime requested but Google Chrome executable was not found on this system");
+    }
+
+    if let Some(p) = app_settings.browser_path {
         let pb = PathBuf::from(p);
         if pb.exists() {
             return Ok(pb);
         }
     }
+    crate::runtime::ensure_bundled_runtime();
     if let Ok(pb) = crate::runtime::binary_path() {
         if pb.exists() {
             return Ok(pb);
         }
     }
     #[cfg(target_os = "macos")]
-    let guess = "/Users/kritos/Documents/GitHub/ShardXBrowser/build/src/out/Release_GN_arm64/ShardX.app/Contents/MacOS/ShardX";
+    let guesses = [
+        "/Users/kritos/Documents/GitHub/ShardXBrowser/build/src/out/Release_GN_arm64/ShardX.app/Contents/MacOS/ShardX",
+        "/Applications/Opinion Insights Browser.app/Contents/MacOS/chrome",
+    ];
     #[cfg(target_os = "windows")]
-    let guess = "C:\\Program Files\\Opinion Insights Browser\\chrome.exe";
+    let guesses = [
+        "C:\\Program Files\\Opinion Insights Browser\\chrome.exe",
+        "C:\\Program Files (x86)\\Opinion Insights Browser\\chrome.exe",
+    ];
     #[cfg(target_os = "linux")]
-    let guess = "/opt/opinion-insights-browser/chrome";
-    let pb = PathBuf::from(guess);
-    if pb.exists() {
-        return Ok(pb);
+    let guesses = [
+        "/opt/opinion-insights-browser/chrome",
+    ];
+    for guess in &guesses {
+        let pb = PathBuf::from(guess);
+        if pb.exists() {
+            return Ok(pb);
+        }
     }
 
     anyhow::bail!("Dedicated Chromium runtime not installed — open Settings to download, or configure Browser path manually")
@@ -48,6 +123,13 @@ pub async fn launch_profile(
     launch_profile_synced(profile_id, enable_cdp, headless, None, 0, "").await
 }
 
+static LAUNCH_LOCKS: std::sync::OnceLock<tokio::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::OnceLock::new();
+
+fn launch_locks() -> &'static tokio::sync::Mutex<std::collections::HashSet<String>> {
+    LAUNCH_LOCKS.get_or_init(|| tokio::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
 /// As `launch_profile`, but joins the browser to a synchronisation group:
 /// every profile launched under the same `sync_group` mirrors input.
 pub async fn launch_profile_synced(
@@ -58,6 +140,39 @@ pub async fn launch_profile_synced(
     bus_port: u16,
     bus_token: &str,
 ) -> Result<LaunchOutcome> {
+    // In-flight launch mutex to serialize rapid double-click or concurrent launches
+    {
+        let mut locks = launch_locks().lock().await;
+        if locks.contains(profile_id) {
+            anyhow::bail!("Launch for profile '{profile_id}' is already in progress.");
+        }
+        locks.insert(profile_id.to_string());
+    }
+
+    struct LaunchLockGuard(String);
+    impl Drop for LaunchLockGuard {
+        fn drop(&mut self) {
+            let id = self.0.clone();
+            tokio::spawn(async move {
+                let mut locks = launch_locks().lock().await;
+                locks.remove(&id);
+            });
+        }
+    }
+    let _guard = LaunchLockGuard(profile_id.to_string());
+
+    // If profile is already running, activate the existing window and return its outcome
+    if Tracker::shared().is_running(profile_id) {
+        if let Some((pid, cdp)) = Tracker::shared().get_outcome(profile_id) {
+            eprintln!("[launcher] Profile '{profile_id}' already running with PID {pid}; focusing window");
+            #[cfg(target_os = "windows")]
+            {
+                focus_browser_window(pid).await;
+            }
+            return Ok(LaunchOutcome { pid, cdp });
+        }
+    }
+
     let account_id = store::active_account_id()?;
     let bin = resolve_binary()?;
     let stored = profile::load_raw(profile_id)?;
@@ -119,15 +234,16 @@ pub async fn launch_profile_synced(
 
     // Per-profile window icon. A failure here is cosmetic, never fatal.
     let color = stored.meta.color.clone().filter(|c| !c.trim().is_empty());
+    let profile_display_name = stored
+        .config
+        .get("name")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or(profile_id)
+        .to_string();
+
     match crate::runtime::runtime_dir().and_then(|dir| {
-        // Display name lives in the config, not in _meta; id as fallback.
-        let name = stored
-            .config
-            .get("name")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or(profile_id);
-        crate::profile_icon::ensure_icon(&dir, name, color.as_deref())
+        crate::profile_icon::ensure_icon(&dir, &profile_display_name, color.as_deref())
     }) {
         Ok(path) => {
             cmd.arg(format!("--shardx-profile-icon={}", path.display()));
@@ -143,17 +259,57 @@ pub async fn launch_profile_synced(
     if let Some(c) = color.as_deref() {
         cmd.arg(format!("--shardx-profile-pill-color={c}"));
     }
+
+    // Window title: "Opinion Insights Browser — <profile name>".
+    // --shardx-window-title is the custom ShardX patch; if the engine doesn't
+    // support it the flag is ignored (Chrome ignores unknown flags).
+    let window_title = format!("{APP_DISPLAY_NAME} — {profile_display_name}");
+    cmd.arg(format!("--shardx-window-title={window_title}"));
+
     cmd.arg("--no-first-run");
+    cmd.arg("--disable-search-engine-choice-screen");
+    cmd.arg("--disable-features=Translate,OptimizationHints,MediaRouter");
+    cmd.arg("--password-store=basic");
+    cmd.arg("--disable-sync");
+    cmd.arg("--disable-default-apps");
+    cmd.arg("--disable-background-networking");
+    cmd.arg("--disable-background-mode");
 
     // Extensions from the library. Chromium loads only what
     // --disable-extensions-except allows, so the two lists have to match.
-    let ext_paths: Vec<String> = stored
+    let mut ext_paths: Vec<String> = stored
         .meta
         .extensions
         .iter()
         .filter_map(|id| extensions::load_path(id))
         .map(|p| p.display().to_string())
         .collect();
+
+    // If an authenticated HTTP/HTTPS/Geolocation proxy is bound, generate a profile-scoped
+    // MV3 extension that answers proxy 407 authentication challenges synchronously via chrome.webRequest.onAuthRequired.
+    // This supplies credentials at the Chromium network layer and eliminates the native "Sign in" popup.
+    let _has_proxy_auth_ext = if let Some(p) = bound_proxy.as_ref() {
+        if p.has_credentials() && matches!(p.kind, proxy::ProxyKind::Http | proxy::ProxyKind::Https | proxy::ProxyKind::Geolocation) {
+            match proxy::create_proxy_auth_extension(&udd, p) {
+                Ok(path) => {
+                    ext_paths.push(path.display().to_string());
+                    eprintln!("[launcher] proxy auth extension injected into profile runtime");
+                    true
+                }
+                Err(e) => {
+                    eprintln!("[launcher] warning: failed to create proxy auth extension: {e}");
+                    false
+                }
+            }
+        } else {
+            let _ = proxy::remove_proxy_auth_extension(&udd);
+            false
+        }
+    } else {
+        let _ = proxy::remove_proxy_auth_extension(&udd);
+        false
+    };
+
     if !ext_paths.is_empty() {
         let joined = ext_paths.join(",");
         cmd.arg(format!("--disable-extensions-except={joined}"));
@@ -307,10 +463,10 @@ pub async fn launch_profile_synced(
         }
     } else {
         cmd.arg("--no-default-browser-check");
-        cmd.arg("--new-window");
-        if urls_to_open.is_empty() {
-            cmd.arg("about:blank");
-        } else {
+        // Only open explicit start URLs; do NOT force about:blank or an extra new-window
+        // when restoring a session, which causes the blank white tab defect.
+        if !urls_to_open.is_empty() {
+            cmd.arg("--new-window");
             for u in urls_to_open {
                 cmd.arg(u);
             }
@@ -336,6 +492,18 @@ pub async fn launch_profile_synced(
     let pid = Tracker::shared().track(profile_id.to_string(), child, stored.meta.temporary);
     eprintln!("[LAUNCH RESULT] SUCCESS -> PID: {pid}");
 
+    // On Windows: after the process starts, set the window title on all windows
+    // belonging to this PID so Alt+Tab shows the correct profile name.
+    // This runs in the background so it doesn't block the launch response.
+    #[cfg(target_os = "windows")]
+    {
+        let title = format!("{APP_DISPLAY_NAME} — {profile_display_name}");
+        let pid_copy = pid;
+        tokio::spawn(async move {
+            set_browser_window_titles(pid_copy, &title).await;
+        });
+    }
+
     profile::touch_launched(profile_id, None)?;
 
     let cdp = if enable_cdp {
@@ -344,12 +512,12 @@ pub async fn launch_profile_synced(
                 eprintln!("[launcher] CDP ready for {profile_id}: {}", c.web_socket_debugger_url);
                 Tracker::shared().set_cdp(profile_id, c.clone());
 
-                // Spawn CDP Fetch auth handler for HTTP/HTTPS proxies with credentials.
-                // Chrome ignores user:pass in --proxy-server for HTTP(S) and shows a
-                // native popup instead — this handler answers auth challenges silently.
+                // Always spawn CDP Fetch proxy auth handler for authenticated HTTP/HTTPS proxies.
+                // Works cooperatively with the MV3 onAuthRequired extension to ensure ZERO native popups:
+                // intercepting early challenges before service workers boot and canceling repetitive challenges.
                 if let Some(p) = bound_proxy.as_ref() {
                     if p.has_credentials() && matches!(p.kind, proxy::ProxyKind::Http | proxy::ProxyKind::Https | proxy::ProxyKind::Geolocation) {
-                        eprintln!("[launcher] spawning proxy auth handler for {}:{}", p.host, p.port);
+                        eprintln!("[launcher] spawning CDP proxy auth handler for {}:{}", p.host, p.port);
                         proxy::spawn_proxy_auth_handler(c.web_socket_debugger_url.clone(), p.clone());
                     }
                 }
@@ -424,7 +592,7 @@ async fn resolve_auto_fields(
     let mut source = "";
     let geo: Option<proxy::GeoInfo> = match proxy_opt {
         Some(p) => {
-            match tokio::time::timeout(std::time::Duration::from_millis(600), proxy::geo_check_via(Some(p), None)).await {
+            match tokio::time::timeout(std::time::Duration::from_millis(3000), proxy::geo_check_via(Some(p), None)).await {
                 Ok(Ok(g)) => { source = "proxy-live"; Some(g) }
                 _ => {
                     eprintln!("[launcher] proxy geo failed/timeout — falling back to cached snapshot");
@@ -662,3 +830,133 @@ fn host_locale() -> Option<String> {
     }
     None
 }
+
+/// On Windows: monitor top-level Chrome_WidgetWin_1 windows for `pid` and maintain
+/// "Opinion Insights Browser — <profile>" or "<tab> — Opinion Insights Browser — <profile>"
+/// as the title, dynamically cleaning any "- ShardX" or "- Google Chrome" suffixes.
+#[cfg(target_os = "windows")]
+async fn set_browser_window_titles(pid: u32, base_title: &str) {
+    use windows_sys::Win32::Foundation::{BOOL, HWND, LPARAM, TRUE};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetClassNameW, GetWindowTextLengthW, GetWindowTextW,
+        GetWindowThreadProcessId, IsWindowVisible, SetWindowTextW,
+    };
+
+    struct Ctx<'a> {
+        pid: u32,
+        base_title: &'a str,
+        found: u32,
+    }
+
+    unsafe extern "system" fn enum_cb(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let ctx = &mut *(lparam as *mut Ctx);
+        let mut wnd_pid: u32 = 0;
+        GetWindowThreadProcessId(hwnd, &mut wnd_pid);
+        if wnd_pid == ctx.pid && IsWindowVisible(hwnd) != 0 {
+            let mut class_buf = [0u16; 64];
+            let len = GetClassNameW(hwnd, class_buf.as_mut_ptr(), 64);
+            let class_name = String::from_utf16_lossy(&class_buf[..len as usize]);
+            if class_name == "Chrome_WidgetWin_1" {
+                let text_len = GetWindowTextLengthW(hwnd);
+                if text_len > 0 {
+                    let mut text_buf = vec![0u16; (text_len + 1) as usize];
+                    let read_len = GetWindowTextW(hwnd, text_buf.as_mut_ptr(), text_len + 1);
+                    let current = String::from_utf16_lossy(&text_buf[..read_len as usize]);
+
+                    let desired = if current.is_empty() || current == "ShardX" || current == "Google Chrome" {
+                        ctx.base_title.to_string()
+                    } else if current.ends_with("- ShardX") {
+                        let prefix = current.trim_end_matches("- ShardX").trim();
+                        format!("{prefix} — {}", ctx.base_title)
+                    } else if current.ends_with("- Google Chrome") {
+                        let prefix = current.trim_end_matches("- Google Chrome").trim();
+                        format!("{prefix} — {}", ctx.base_title)
+                    } else if !current.contains("Opinion Insights") {
+                        format!("{current} — {}", ctx.base_title)
+                    } else {
+                        current.clone()
+                    };
+
+                    if desired != current {
+                        let wide: Vec<u16> = desired.encode_utf16().chain(std::iter::once(0)).collect();
+                        SetWindowTextW(hwnd, wide.as_ptr());
+                    }
+                } else {
+                    let wide: Vec<u16> = ctx.base_title.encode_utf16().chain(std::iter::once(0)).collect();
+                    SetWindowTextW(hwnd, wide.as_ptr());
+                }
+                ctx.found += 1;
+            }
+        }
+        TRUE // continue enumeration
+    }
+
+    // Monitor while the process is alive
+    while is_pid_alive_check(pid) {
+        let mut ctx = Ctx { pid, base_title, found: 0 };
+        unsafe {
+            EnumWindows(Some(enum_cb), &mut ctx as *mut Ctx as LPARAM);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn is_pid_alive_check(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    if pid == 0 { return false; }
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() { return false; }
+        let mut code: u32 = 0;
+        let ok = GetExitCodeProcess(handle, &mut code);
+        CloseHandle(handle);
+        ok != 0 && code == 259
+    }
+}
+
+#[cfg(target_os = "windows")]
+pub async fn focus_browser_window(pid: u32) {
+    use windows_sys::Win32::Foundation::{BOOL, HWND, LPARAM, TRUE};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetClassNameW, GetWindowThreadProcessId, IsWindowVisible,
+        SetForegroundWindow, ShowWindow, SW_RESTORE,
+    };
+
+    struct FocusCtx {
+        pid: u32,
+        focused: bool,
+    }
+
+    unsafe extern "system" fn enum_focus_cb(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let ctx = &mut *(lparam as *mut FocusCtx);
+        let mut wnd_pid: u32 = 0;
+        GetWindowThreadProcessId(hwnd, &mut wnd_pid);
+        if wnd_pid == ctx.pid && IsWindowVisible(hwnd) != 0 {
+            let mut class_buf = [0u16; 64];
+            let len = GetClassNameW(hwnd, class_buf.as_mut_ptr(), 64);
+            let class_name = String::from_utf16_lossy(&class_buf[..len as usize]);
+            if class_name == "Chrome_WidgetWin_1" {
+                ShowWindow(hwnd, SW_RESTORE);
+                SetForegroundWindow(hwnd);
+                ctx.focused = true;
+                return 0; // stop enumeration once main frame is focused
+            }
+        }
+        TRUE
+    }
+
+    let mut ctx = FocusCtx { pid, focused: false };
+    unsafe {
+        EnumWindows(Some(enum_focus_cb), &mut ctx as *mut FocusCtx as LPARAM);
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+async fn set_browser_window_titles(_pid: u32, _title: &str) {}
+
+#[cfg(not(target_os = "windows"))]
+pub async fn focus_browser_window(_pid: u32) {}

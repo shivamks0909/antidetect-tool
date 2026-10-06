@@ -8,7 +8,7 @@
     "ShardX-Widevine-Win.zip": "8852779330edb7ac2096e0d21dc3afb5",
     "ShardX-Windows.zip": "dc9da8907d40d91e8b0e964ed7dc43c7-24"
   },
-  "chromium_version": "152.0.7977.65",
+  "chromium_version": "140.0.7339.210",
   "engine_build": "2",
   "min_launcher_version": "2.0.1",
   "min_sdk_version": "2.0.2",

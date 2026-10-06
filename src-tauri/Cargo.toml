@@ -1,6 +1,6 @@
 [package]
 name = "opinion-insights-launcher"
-version = "2.3.0"
+version = "2.4.0"
 description = "Opinion Insights Browser Desktop Launcher"
 authors = ["Opinion Insights Team"]
 edition = "2021"
@@ -72,7 +72,7 @@ getrandom = "0.2"
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",            # HLOCAL + LocalFree live here in 0.59
     "Win32_Security_Cryptography", # CryptProtectData / CryptUnprotectData
-    "Win32_UI_WindowsAndMessaging", # GetForegroundWindow, GetWindowThreadProcessId
+    "Win32_UI_WindowsAndMessaging", # GetForegroundWindow, GetWindowThreadProcessId, EnumWindows, SetWindowTextW, IsWindowVisible
     "Win32_UI_Shell",               # ShellExecute
     "Win32_System_Threading",       # OpenProcess for PID resolution
 ] }

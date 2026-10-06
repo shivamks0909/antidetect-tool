@@ -1,5 +1,5 @@
 import { useEffect, useRef } from "react";
-import { helperProfiles, helperShow, helperClose } from "../../entities/profile/model/api";
+import { helperProfiles, helperFields, helperShow, helperClose } from "../../entities/profile/model/api";
 
 /**
  * Opens and closes the Shard Helper panel as pages come and go. Renders nothing;
@@ -17,10 +17,31 @@ export function HelperWatcher() {
         if (!alive) return;
         // One panel, so one profile: two would fight for the same corner.
         const next = profiles[0] ?? null;
+        if (!next) {
+          if (shownFor.current !== null) {
+            shownFor.current = null;
+            await helperClose();
+          }
+          return;
+        }
+
+        // Only pop up the helper window if there are actual fillable fields detected!
+        // Otherwise, HelperPanel immediately calls helperClose, causing a fraction-of-a-second window flash.
+        const report = await helperFields(next);
+        if (!alive) return;
+        const hasFields = Boolean(report?.fields && report.fields.length > 0);
+
+        if (!hasFields) {
+          if (shownFor.current !== null) {
+            shownFor.current = null;
+            await helperClose();
+          }
+          return;
+        }
+
         if (next === shownFor.current) return;
         shownFor.current = next;
-        if (next) await helperShow(next);
-        else await helperClose();
+        await helperShow(next);
       } catch { /* the bus may not be up yet */ }
     };
     void tick();

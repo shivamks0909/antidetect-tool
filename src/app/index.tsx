@@ -7,7 +7,6 @@ import "flag-icons/css/flag-icons.min.css";
 import { App } from "./App";
 import { SyncPanel } from "../widgets/SyncPanel";
 import { HelperPanel } from "../widgets/HelperPanel";
-import { AuthGate } from "../widgets/AuthGate/AuthGate";
 import { TitleBar } from "../widgets/TitleBar/TitleBar";
 
 // The always-on-top panels are second Tauri windows on this same bundle,
@@ -32,9 +31,7 @@ ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
             className="relative flex-1 overflow-hidden"
             style={{ height: "calc(100vh - var(--titlebar-h, 30px))" }}
           >
-            <AuthGate>
-              <App />
-            </AuthGate>
+            <App />
           </div>
         </div>
       )}

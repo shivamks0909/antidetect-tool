@@ -123,8 +123,27 @@ impl Tracker {
         self.inner.lock().ok()?.get(profile_id)?.cdp.clone()
     }
 
-    pub fn running(&self) -> Vec<RunningProfile> {
+    pub fn is_running(&self, profile_id: &str) -> bool {
+        let mut g = self.inner.lock().unwrap();
+        if let Some(entry) = g.get(profile_id) {
+            if is_pid_alive(entry.pid) {
+                return true;
+            }
+            // Process has exited, clean up stale entry
+            g.remove(profile_id);
+        }
+        false
+    }
+
+    pub fn get_outcome(&self, profile_id: &str) -> Option<(u32, Option<CdpInfo>)> {
         let g = self.inner.lock().unwrap();
+        g.get(profile_id).map(|e| (e.pid, e.cdp.clone()))
+    }
+
+    pub fn running(&self) -> Vec<RunningProfile> {
+        let mut g = self.inner.lock().unwrap();
+        // Prune any dead processes before reporting
+        g.retain(|_, e| is_pid_alive(e.pid));
         g.iter()
             .map(|(id, e)| RunningProfile {
                 profile_id: id.clone(),
@@ -151,8 +170,8 @@ impl Tracker {
     /// Synchronous force-kill for cleanup routines before filesystem deletion
     pub fn kill_sync(&self, profile_id: &str) -> bool {
         let entry = {
-            let g = self.inner.lock().unwrap();
-            g.get(profile_id).map(|e| (e.pid, e.killer.clone()))
+            let mut g = self.inner.lock().unwrap();
+            g.remove(profile_id).map(|e| (e.pid, e.killer))
         };
         if let Some((pid, killer)) = entry {
             let _ = killer.try_send(());
@@ -188,10 +207,67 @@ impl Tracker {
         count
     }
 
+    /// Synchronously kill all running profiles upon launcher exit to prevent orphan/ghost processes.
+    pub fn kill_all_sync(&self) -> usize {
+        let pids: Vec<u32> = {
+            let mut g = self.inner.lock().unwrap();
+            let list = g.values().map(|e| e.pid).collect();
+            g.clear();
+            list
+        };
+        let count = pids.len();
+        for pid in pids {
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                let _ = std::process::Command::new("taskkill")
+                    .args(["/F", "/PID", &pid.to_string()])
+                    .creation_flags(0x08000000)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+            }
+            #[cfg(unix)]
+            {
+                unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL); }
+            }
+        }
+        count
+    }
+
     pub fn shared() -> &'static Tracker {
         static INSTANCE: std::sync::OnceLock<Tracker> = std::sync::OnceLock::new();
         INSTANCE.get_or_init(Tracker::new)
     }
+}
+
+#[cfg(target_os = "windows")]
+fn is_pid_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    if pid == 0 {
+        return false;
+    }
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return false;
+        }
+        let mut exit_code: u32 = 0;
+        let ok = GetExitCodeProcess(handle, &mut exit_code);
+        CloseHandle(handle);
+        ok != 0 && exit_code == 259 // 259 = STILL_ACTIVE
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn is_pid_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
 }
 
 #[derive(Debug, Clone, serde::Serialize)]

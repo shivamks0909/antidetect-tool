@@ -4,7 +4,6 @@ import { confirmModal } from "../../../shared/lib/confirm";
 import { storeBus } from "../../../shared/lib/storeBus";
 import { trashEmpty, trashList, trashPurge, trashRestore } from "../model/api";
 import type { TrashEntry } from "../model/types";
-import { API_BASE, apiFetch } from "../../../config/api";
 
 export type TrashStore = {
   status: "idle" | "loading" | "ready" | "error";
@@ -34,8 +33,6 @@ export const useTrash = create<TrashStore>((set, get) => ({
 
   init: async () => {
     if (get().status === "loading" || get().status === "ready") return;
-    const token = localStorage.getItem("opinion_jwt_token");
-    if (!token) return;
     set({ status: "loading" });
     try { set({ items: await trashList(), status: "ready" }); }
     catch (e) { set({ status: "error" }); toast.err(String(e)); }
@@ -65,15 +62,6 @@ export const useTrash = create<TrashStore>((set, get) => ({
     if (ok !== true) return;
     try {
       await trashPurge(e.id);
-      const token = localStorage.getItem("opinion_jwt_token");
-      if (token) {
-        try {
-          await apiFetch(`${API_BASE}/data/profiles/${e.id}`, {
-            method: "DELETE",
-            headers: { Authorization: `Bearer ${token}` },
-          });
-        } catch {}
-      }
       await get().reload();
     } catch (err) { toast.err(String(err)); }
   },
@@ -90,17 +78,6 @@ export const useTrash = create<TrashStore>((set, get) => ({
     if (ok !== true) return;
     try {
       await trashEmpty();
-      const token = localStorage.getItem("opinion_jwt_token");
-      if (token) {
-        for (const item of items) {
-          try {
-            await apiFetch(`${API_BASE}/data/profiles/${item.id}`, {
-              method: "DELETE",
-              headers: { Authorization: `Bearer ${token}` },
-            });
-          } catch {}
-        }
-      }
       await get().reload();
       toast.ok(`Deleted ${n}`);
     } catch (err) { toast.err(String(err)); }

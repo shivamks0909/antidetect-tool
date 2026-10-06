@@ -31,7 +31,6 @@ import { toast } from "../../../shared/lib/toast";
 import { storeBus } from "../../../shared/lib/storeBus";
 import { useProfile } from "../../../entities/profile";
 import { useProxy } from "../../../entities/proxy";
-import { useAuthStore } from "../../auth/model/useAuthStore";
 import { useExtensions } from "../../../entities/extension";
 import {
   CANONICAL_FIELDS,
@@ -65,7 +64,7 @@ export function BatchImportModal({
   open: boolean;
   onClose: () => void;
 }) {
-  const accountId = useAuthStore((s) => s.user?.id) || "anonymous";
+  const accountId = "default";
 
   const [step, setStep] = useState<ModalStep>("upload");
   const [fileData, setFileData] = useState<ParsedSheetData | null>(null);

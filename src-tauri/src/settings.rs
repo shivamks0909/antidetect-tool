@@ -20,7 +20,7 @@ pub struct Settings {
     pub screen_resolution_mode: Option<String>,
     /// Offer to fill fields a generated identity fits. Never applies to a
     /// synchronised launch — input is already mirrored there.
-    #[serde(default = "default_true")]
+    #[serde(default = "default_false")]
     pub helper_enabled: bool,
     /// Profile's camera is ShardX's rather than the machine's. On by default:
     /// the host's real camera contradicts the fingerprint and links profiles.
@@ -39,21 +39,22 @@ pub struct Settings {
     /// config dir. Changed through `data_root_migrate`, never by hand.
     #[serde(default)]
     pub data_root: Option<String>,
+    /// Browser runtime selection: "managed" (default bundled Chromium) or "chrome" (official Google Chrome).
+    #[serde(default)]
+    pub browser_runtime: Option<String>,
 
-    // ---- Local automation HTTP API (axum + JWT bearer) ----
-    /// Whether the local API server listens on 127.0.0.1:`api_port`.
+    /// Automation HTTP API enabled state.
     #[serde(default = "default_api_enabled")]
     pub api_enabled: bool,
-    /// Port the API binds on 127.0.0.1.
+    /// Automation HTTP API listen port (localhost only).
     #[serde(default = "default_api_port")]
     pub api_port: u16,
-    /// HS256 signing key for API JWTs.  Auto-generated on first run
-    /// (see `ensure_secret`); rotating it invalidates issued tokens.
+    /// Automation HTTP API JWT HMAC secret key (generated on first boot).
     #[serde(default)]
     pub api_secret: String,
 
-    // ---- Clipboard auto-typing ----
-    #[serde(default = "AutoTypeSettings::default")]
+    /// Keystroke / CDP auto typing subsystem settings.
+    #[serde(default)]
     pub auto_type: AutoTypeSettings,
 }
 
@@ -101,12 +102,16 @@ fn default_true() -> bool {
     true
 }
 
+fn default_false() -> bool {
+    false
+}
+
 fn default_theme() -> String {
     "dark".into()
 }
 
 fn default_minimize_to_tray() -> bool {
-    true
+    false
 }
 
 fn default_api_enabled() -> bool {
@@ -122,10 +127,11 @@ pub fn load() -> Result<Settings> {
     if !path.exists() {
         return Ok(Settings {
             browser_path: None,
+            browser_runtime: None,
             theme: default_theme(),
             geo_checker: Some("ip-api.com".into()),
             screen_resolution_mode: Some("fingerprint".into()),
-            helper_enabled: default_true(),
+            helper_enabled: default_false(),
             camera_enabled: default_true(),
             helper_triggers: Vec::new(),
             minimize_to_tray: default_minimize_to_tray(),

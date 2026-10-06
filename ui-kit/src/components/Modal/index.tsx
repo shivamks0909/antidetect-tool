@@ -37,6 +37,10 @@ export default function Modal({
       requestAnimationFrame(() => requestAnimationFrame(() => setVisible(true)))
     } else {
       setVisible(false)
+      const timer = setTimeout(() => {
+        setRender(false)
+      }, 250)
+      return () => clearTimeout(timer)
     }
   }, [open])
 
@@ -62,8 +66,8 @@ export default function Modal({
       className="fixed inset-0 z-50 flex items-center justify-center p-4 transition-colors duration-200"
       style={{ backgroundColor: visible ? 'var(--backdrop)' : 'transparent' }}
       onClick={onClose}
-      onTransitionEnd={() => {
-        if (!open) setRender(false)
+      onTransitionEnd={(e) => {
+        if (e.target === e.currentTarget && !open) setRender(false)
       }}
     >
       <div

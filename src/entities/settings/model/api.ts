@@ -4,7 +4,8 @@ import type { Settings, ApiInfo, DataRootInfo } from "./types";
 const defaultSettings: Settings = {
   browser_path: null,
   theme: "dark",
-  minimize_to_tray: true,
+  minimize_to_tray: false,
+  helper_enabled: false,
   camera_enabled: false,
 };
 

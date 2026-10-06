@@ -402,6 +402,7 @@ function parseAndValidateProxy(input: ProxyParseInput): { proxy?: ProxyEntry; er
   let password = "";
   let location_label: string | undefined = undefined;
   let raw_input: string | undefined = undefined;
+  let source_format: string | undefined = undefined;
 
   // Normalize kind
   if (input.kind) {
@@ -425,6 +426,7 @@ function parseAndValidateProxy(input: ProxyParseInput): { proxy?: ProxyEntry; er
       password = parsed.password || "";
       raw_input = parsed.raw_input;
       location_label = parsed.location_label || undefined;
+      source_format = parsed.source_format || (parsed.scheme === "geolocation" ? "geolocation" : (input.kind || "http"));
       kind = (parsed.scheme === "geolocation" ? "geolocation" : (parsed.protocol as ProxyEntry["kind"])) || kind;
     } catch (err: any) {
       return { error: `Invalid proxy format "${input.raw}": ${err.message}` };
@@ -435,6 +437,7 @@ function parseAndValidateProxy(input: ProxyParseInput): { proxy?: ProxyEntry; er
     port = parseInt(input.port || "1080", 10);
     username = input.user || "";
     password = input.pass || "";
+    source_format = input.kind || "http";
     raw_input = `${host}:${port}`;
   }
 
@@ -463,6 +466,7 @@ function parseAndValidateProxy(input: ProxyParseInput): { proxy?: ProxyEntry; er
       username,
       password,
       country: location_label || "",
+      source_format,
       location_label,
       raw_input: raw_input || `${host}:${port}`,
       notes: input.rotateUrl

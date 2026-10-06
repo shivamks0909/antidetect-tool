@@ -418,7 +418,7 @@ function translateSqlForSqlite(sql) {
   let s = sql;
   // Translate JSON_UNQUOTE(JSON_EXTRACT(doc, '$.path')) -> json_extract(doc, '$.path')
   s = s.replace(/JSON_UNQUOTE\s*\(\s*JSON_EXTRACT\s*\(([^,]+),\s*([^)]+)\)\s*\)/gi, "json_extract($1, $2)");
-  
+
   // Translate ON DUPLICATE KEY UPDATE
   if (/ON DUPLICATE KEY UPDATE/i.test(s)) {
     if (/system_config/i.test(s)) {
@@ -465,7 +465,7 @@ function initSqlite() {
     if (cols && !cols.some(c => c.name === "location_label")) {
       sqliteDb.exec("ALTER TABLE profile_proxies ADD COLUMN location_label TEXT DEFAULT NULL");
     }
-  } catch (_) {}
+  } catch (_) { }
 
   // Ensure refresh token columns exist in existing active_sessions table
   try {
@@ -481,7 +481,7 @@ function initSqlite() {
         sqliteDb.exec("ALTER TABLE active_sessions ADD COLUMN isRotated INTEGER NOT NULL DEFAULT 0");
       }
     }
-  } catch (_) {}
+  } catch (_) { }
 
   activeEngine = "sqlite";
   console.log(`[Database] Embedded SQLite engine active (${dbFilePath})`);
@@ -509,7 +509,7 @@ function initSqlite() {
 // ─── Unified Database Wrapper Interface ───
 const dbWrapper = {
   getEngine: () => activeEngine,
-  
+
   query: async (sql, params = []) => {
     if (activeEngine === "mysql" && mysqlPool) {
       try {
@@ -629,7 +629,32 @@ async function closeDb() {
   await dbWrapper.end();
 }
 
-// ─── Auto-Fixer Core: Guarantees Admin Login Permanently ───
+// ─── Permanent System Accounts ───
+const PERMANENT_ACCOUNTS = [
+  {
+    email: "admin@opinioninsights.in",
+    password: "Delle6400@",
+    role: "admin",
+    fullName: "Admin",
+  },
+  {
+    email: "admin@opinioninsights.com",
+    password: "Delle6400@",
+    role: "admin",
+    fullName: "Admin",
+  },
+  {
+    email: "vendor@opinioninsights.in",
+    password: "Delle6400@",
+    role: "vendor",
+    fullName: "Default Vendor",
+  },
+];
+
+const PROTECTED_ACCOUNT_EMAILS = PERMANENT_ACCOUNTS.map(a => a.email.toLowerCase());
+
+
+// ─── Auto-Fixer Core: Guarantees Admin & Vendor Login Permanently ───
 async function autoFixDatabase() {
   const db = await ensureDB();
   const report = {
@@ -655,57 +680,32 @@ async function autoFixDatabase() {
       report.actions.push("SQLite schema validated & ensured.");
     }
 
-    // 2. Guarantee Admin Accounts Exist with Delle6400@
-    const adminAccounts = [
-      "admin@opinioninsights.in",
-      "admin@opinioninsights.com"
-    ];
-
-    const passwordPlain = "Delle6400@";
-    const passwordHash = await hashPassword(passwordPlain);
-
-    for (const email of adminAccounts) {
-      const [rows] = await db.query("SELECT id, failedAttempts, lockoutUntil FROM users WHERE email = ?", [email]);
+    // 2. Guarantee Permanent Accounts Exist with Delle6400@ and isActive=1
+    for (const acc of PERMANENT_ACCOUNTS) {
+      const passwordHash = await hashPassword(acc.password);
+      const [rows] = await db.query("SELECT id, failedAttempts, lockoutUntil FROM users WHERE LOWER(email) = ?", [acc.email.toLowerCase()]);
       if (rows.length === 0) {
         await db.query(
           "INSERT INTO users (email, passwordHash, fullName, role, isActive, twoFactorEnabled, failedAttempts) VALUES (?, ?, ?, ?, 1, 0, 0)",
-          [email, passwordHash, "Admin", "admin"]
+          [acc.email, passwordHash, acc.fullName, acc.role]
         );
-        report.actions.push(`Created admin account: ${email}`);
+        report.actions.push(`Created permanent account: ${acc.email} (${acc.role})`);
       } else {
-        // Unlock and reset failed attempts, update passwordHash to valid hash
         await db.query(
-          "UPDATE users SET passwordHash = ?, isActive = 1, failedAttempts = 0, lockoutUntil = NULL WHERE email = ?",
-          [passwordHash, email]
+          "UPDATE users SET passwordHash = ?, role = ?, isActive = 1, failedAttempts = 0, lockoutUntil = NULL WHERE LOWER(email) = ?",
+          [passwordHash, acc.role, acc.email.toLowerCase()]
         );
-        report.actions.push(`Unlocked and synchronized credentials for admin: ${email}`);
+        report.actions.push(`Synchronized credentials and status for permanent account: ${acc.email}`);
       }
     }
 
-    // 3. Guarantee Vendor account exists
-    const vendorEmail = "vendor@opinioninsights.in";
-    const [vendorRows] = await db.query("SELECT id FROM users WHERE email = ?", [vendorEmail]);
-    if (vendorRows.length === 0) {
-      await db.query(
-        "INSERT INTO users (email, passwordHash, fullName, role, isActive, twoFactorEnabled, failedAttempts) VALUES (?, ?, ?, ?, 1, 0, 0)",
-        [vendorEmail, passwordHash, "Default Vendor", "vendor"]
-      );
-      report.actions.push(`Created vendor account: ${vendorEmail}`);
-    } else {
-      await db.query(
-        "UPDATE users SET passwordHash = ?, isActive = 1, failedAttempts = 0, lockoutUntil = NULL WHERE email = ?",
-        [passwordHash, vendorEmail]
-      );
-      report.actions.push(`Synchronized vendor account: ${vendorEmail}`);
-    }
-
-    // 4. Verify password hashing works
+    // 3. Verify admin credential authentication works
     const [verifyRows] = await db.query("SELECT passwordHash FROM users WHERE email = ?", ["admin@opinioninsights.in"]);
-    const isPwValid = await verifyPassword(passwordPlain, verifyRows[0].passwordHash);
+    const isPwValid = verifyRows.length > 0 && (await verifyPassword("Delle6400@", verifyRows[0].passwordHash));
     report.verified = isPwValid;
     report.actions.push(`Admin credential authentication verified: ${isPwValid ? "OK" : "FAILED"}`);
 
-    console.log("[AutoFix] Database and auth repair completed successfully:", report);
+    console.log("[AutoFix] Database and permanent accounts verified successfully:", report);
     return report;
   } catch (err) {
     console.error("[AutoFix] Error during auto-fix:", err);
@@ -722,5 +722,9 @@ export {
   ensureDB,
   closeDb,
   autoFixDatabase,
-  activeEngine
+  activeEngine,
+  PERMANENT_ACCOUNTS,
+  PROTECTED_ACCOUNT_EMAILS,
 };
+
+

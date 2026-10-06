@@ -107,6 +107,9 @@ export const useUpdaterStore = create<UpdaterState>((set, get) => ({
         // Session-level dismiss: if same version dismissed, don't auto-show
         const wasDismissed = get().dismissedVersion === info.version;
 
+        const { autoDownload } = get().preferences;
+        const shouldOpen = silent ? (!wasDismissed && !autoDownload) : true;
+
         set({
           status: 'available',
           updateInfo: info,
@@ -114,13 +117,11 @@ export const useUpdaterStore = create<UpdaterState>((set, get) => ({
           lastCheckedAt: new Date().toLocaleTimeString(),
           checkingLocked: false,
           dismissedVersion: wasDismissed ? get().dismissedVersion : null,
-          isOpen: silent ? !wasDismissed : true,
+          isOpen: shouldOpen,
         });
 
-        // Auto-download: if enabled and silent check, start downloading immediately
-        const { autoDownload } = get().preferences;
+        // Auto-download: if enabled and silent check, start downloading immediately without opening modal
         if (autoDownload && silent && !wasDismissed) {
-          set({ isOpen: false });
           get().startDownloadAndInstall();
         }
       } else {

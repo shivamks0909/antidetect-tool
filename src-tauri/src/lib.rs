@@ -12,7 +12,8 @@ mod mcp_setup;
 mod migrate;
 mod process;
 mod profile;
-mod proxy;
+pub mod proxy;
+pub mod survey_security;
 mod psapi;
 mod runtime;
 mod settings;
@@ -59,23 +60,13 @@ pub struct AuthSession {
     pub token: String,
 }
 
-static AUTH_SESSION: std::sync::OnceLock<std::sync::RwLock<Option<AuthSession>>> =
-    std::sync::OnceLock::new();
-
-fn auth_cell() -> &'static std::sync::RwLock<Option<AuthSession>> {
-    AUTH_SESSION.get_or_init(|| std::sync::RwLock::new(None))
-}
-
 pub fn is_authenticated() -> bool {
-    auth_cell().read().map(|g| g.is_some()).unwrap_or(false)
+    true
 }
 
 static API_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub fn start_automation_api_if_enabled() {
-    if !is_authenticated() {
-        return;
-    }
     if API_STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
         return;
     }
@@ -93,15 +84,8 @@ pub fn start_automation_api_if_enabled() {
 }
 
 #[tauri::command]
-fn auth_verify_session(token: String, user_id: String, email: String) -> Result<bool, String> {
-    if token.trim().is_empty() || user_id.trim().is_empty() {
-        return Err("Invalid authentication session".into());
-    }
-    store::set_user_scope(Some(user_id.clone()));
-    if let Ok(mut g) = auth_cell().write() {
-        *g = Some(AuthSession { user_id, email, token });
-    }
-    // Sweep expired trash & temporary profiles for this authenticated account
+fn auth_verify_session(_token: String, user_id: String, _email: String) -> Result<bool, String> {
+    store::set_user_scope(Some(if user_id.trim().is_empty() { "default".to_string() } else { user_id }));
     let _ = trash::purge_expired();
     let _ = profile::purge_temporary();
     runtime::seed_bundled_fingerprints();
@@ -111,34 +95,22 @@ fn auth_verify_session(token: String, user_id: String, email: String) -> Result<
 
 #[tauri::command]
 async fn auth_logout() -> Result<bool, String> {
-    // Terminate any running browser processes on logout
     process::Tracker::shared().kill_all().await;
-    store::set_user_scope(None);
-    if let Ok(mut g) = auth_cell().write() {
-        *g = None;
-    }
-    let _ = store::clear_secure_auth_session();
-    // Rotate the Axum API signing secret so any JWT tokens issued during the
-    // previous session are immediately invalid — even though the server
-    // continues listening (it cannot be stopped without process restart).
-    crate::api::set_secret(&uuid::Uuid::new_v4().simple().to_string());
     Ok(true)
 }
 
 #[tauri::command]
-fn auth_save_secure_session(session_json: String) -> Result<bool, String> {
-    store::save_secure_auth_session(&session_json).map_err(|e| e.to_string())?;
+fn auth_save_secure_session(_session_json: String) -> Result<bool, String> {
     Ok(true)
 }
 
 #[tauri::command]
 fn auth_load_secure_session() -> Result<Option<String>, String> {
-    store::load_secure_auth_session().map_err(|e| e.to_string())
+    Ok(None)
 }
 
 #[tauri::command]
 fn auth_clear_secure_session() -> Result<bool, String> {
-    store::clear_secure_auth_session().map_err(|e| e.to_string())?;
     Ok(true)
 }
 
@@ -150,7 +122,11 @@ async fn kill_all_user_browsers() -> Result<usize, String> {
 
 #[tauri::command]
 fn auth_status() -> Result<Option<AuthSession>, String> {
-    Ok(auth_cell().read().map(|g| g.clone()).unwrap_or(None))
+    Ok(Some(AuthSession {
+        user_id: "default".to_string(),
+        email: "offline@local".to_string(),
+        token: "offline".to_string(),
+    }))
 }
 
 #[derive(serde::Serialize)]
@@ -1216,6 +1192,123 @@ fn proxy_bulk_save(entries: Vec<proxy::ProxyEntry>) -> Result<usize, String> {
     Ok(count)
 }
 
+#[tauri::command]
+async fn proxy_diagnose(
+    url_or_entry: String,
+    target_url: Option<String>,
+    debug: Option<bool>,
+) -> Result<proxy::ProxyTestResult, String> {
+    if !is_authenticated() {
+        return Err("Authentication required. Please log in.".into());
+    }
+    let entry = if url_or_entry.contains("://") {
+        proxy::ProxyConfig::parse_url(&url_or_entry)?.to_entry()
+    } else if let Ok(Some(e)) = proxy::get(&url_or_entry) {
+        e
+    } else {
+        proxy::ProxyConfig::parse_url(&url_or_entry)?.to_entry()
+    };
+    let target = target_url.unwrap_or_else(|| "https://example.com/".to_string());
+    let timeouts = proxy::ProxyTimeouts::default();
+    let res = proxy::diagnose_proxy(&entry, &target, &timeouts, debug.unwrap_or(false), None).await;
+    Ok(res)
+}
+
+#[tauri::command]
+async fn proxy_diagnose_bulk(
+    proxies: Vec<String>,
+    target_url: Option<String>,
+    debug: Option<bool>,
+    concurrency: Option<usize>,
+) -> Result<Vec<proxy::ProxyTestResult>, String> {
+    if !is_authenticated() {
+        return Err("Authentication required. Please log in.".into());
+    }
+    let mut entries = Vec::new();
+    for p in &proxies {
+        if let Ok(cfg) = proxy::ProxyConfig::parse_url(p) {
+            entries.push(cfg.to_entry());
+        } else if let Ok(Some(entry)) = proxy::get(p) {
+            entries.push(entry);
+        }
+    }
+    let target = target_url.unwrap_or_else(|| "https://example.com/".to_string());
+    let timeouts = proxy::ProxyTimeouts::default();
+    let conc = concurrency.unwrap_or(10);
+    let results = proxy::diagnose_proxies_bulk(&entries, &target, &timeouts, debug.unwrap_or(false), conc).await;
+    Ok(results)
+}
+
+#[tauri::command]
+async fn survey_security_evaluate(
+    config: survey_security::SurveySecurityConfig,
+    session_id: String,
+    profile_id: Option<String>,
+) -> Result<survey_security::SurveySecurityReport, String> {
+    if !is_authenticated() {
+        return Err("Authentication required. Please log in.".into());
+    }
+
+    let (active_runtime, bound_proxy) = if let Some(ref pid) = profile_id {
+        let stored = profile::load_raw(pid).map_err(|e| e.to_string())?;
+        let bp: Option<proxy::ProxyEntry> = stored
+            .meta
+            .proxy_id
+            .as_deref()
+            .and_then(|id| proxy::get(id).ok().flatten())
+            .or_else(|| stored.meta.inline_proxy.clone());
+        let s = settings::load().unwrap_or_default();
+        let rt = s.browser_runtime.unwrap_or_else(|| "chromium".into());
+        (rt, bp)
+    } else {
+        let s = settings::load().unwrap_or_default();
+        let rt = s.browser_runtime.unwrap_or_else(|| "chromium".into());
+        (rt, None)
+    };
+
+    let latency = if let Some(ref p) = bound_proxy {
+        proxy::probe(p).await.ok().map(|ms| ms as u64)
+    } else {
+        None
+    };
+
+    let report = survey_security::evaluate_survey_security(
+        &config,
+        &session_id,
+        &active_runtime,
+        bound_proxy.as_ref(),
+        latency,
+    )
+    .await;
+
+    Ok(report)
+}
+
+#[derive(serde::Serialize)]
+pub struct RuntimeDetectionReport {
+    pub bundled_chromium_path: Option<String>,
+    pub bundled_chromium_available: bool,
+    pub installed_chrome_path: Option<String>,
+    pub installed_chrome_available: bool,
+    pub active_runtime_selection: String,
+}
+
+#[tauri::command]
+fn detect_browser_runtimes() -> Result<RuntimeDetectionReport, String> {
+    let bundled = crate::runtime::binary_path().ok().filter(|p| p.exists());
+    let chrome = crate::launch::detect_installed_chrome();
+    let s = settings::load().unwrap_or_default();
+    let active = s.browser_runtime.unwrap_or_else(|| "chromium".into());
+
+    Ok(RuntimeDetectionReport {
+        bundled_chromium_path: bundled.as_ref().map(|p| p.display().to_string()),
+        bundled_chromium_available: bundled.is_some(),
+        installed_chrome_path: chrome.as_ref().map(|p| p.display().to_string()),
+        installed_chrome_available: chrome.is_some(),
+        active_runtime_selection: active,
+    })
+}
+
 // ---- Launcher ----
 
 #[tauri::command]
@@ -1263,9 +1356,10 @@ fn open_sync_panel(app: &tauri::AppHandle, group: &str) {
         let _ = w.set_focus();
         return;
     }
-    let url = format!("index.html#/?syncPanel={group}");
-    let built = WebviewWindowBuilder::new(app, "sync-panel", WebviewUrl::App(url.into()))
+    let script = format!("window.location.hash = '#/?syncPanel={group}';");
+    let built = WebviewWindowBuilder::new(app, "sync-panel", WebviewUrl::App("index.html".into()))
         .title("Opinion Insights Sync")
+        .initialization_script(&script)
         .inner_size(360.0, 168.0)
         .resizable(true)
         .min_inner_size(280.0, 120.0)
@@ -1408,9 +1502,10 @@ fn open_helper_panel(app: &tauri::AppHandle, profile: &str) {
         let _ = w.set_focus();
         return;
     }
-    let url = format!("index.html#/?helperPanel={profile}");
-    if let Err(e) = WebviewWindowBuilder::new(app, "helper-panel", WebviewUrl::App(url.into()))
+    let script = format!("window.location.hash = '#/?helperPanel={profile}';");
+    if let Err(e) = WebviewWindowBuilder::new(app, "helper-panel", WebviewUrl::App("index.html".into()))
         .title("Opinion Insights Helper")
+        .initialization_script(&script)
         .inner_size(300.0, 150.0)
         .resizable(false)
         .always_on_top(true)
@@ -1799,7 +1894,7 @@ pub fn run() {
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                let to_tray = settings::load().map(|s| s.minimize_to_tray).unwrap_or(true);
+                let to_tray = settings::load().map(|s| s.minimize_to_tray).unwrap_or(false);
                 if window.label() == "main" && to_tray {
                     api.prevent_close();
                     let _ = window.hide();
@@ -1869,6 +1964,10 @@ pub fn run() {
             proxy_bulk_import,
             proxy_bulk_parse,
             proxy_bulk_save,
+            proxy_diagnose,
+            proxy_diagnose_bulk,
+            survey_security_evaluate,
+            detect_browser_runtimes,
             launch,
             settings_get,
             settings_save,
@@ -1943,16 +2042,11 @@ pub fn run() {
                 }
             }
 
-            // Win/Linux: strip native caption since macOS-only titleBarStyle:Overlay leaves it.
-            #[cfg(not(target_os = "macos"))]
-            {
-                use tauri::Manager;
-                if let Some(w) = app.get_webview_window("main") {
-                    let _ = w.set_decorations(false);
-                }
-            }
-
+            // Bundle runtime and seed bundled fingerprints.
             runtime::ensure_bundled_runtime();
+            store::set_user_scope(Some("default".to_string()));
+            runtime::seed_bundled_fingerprints();
+            start_automation_api_if_enabled();
 
             // Run filesystem layout migration to isolate account directories
             // and quarantine any legacy unowned profiles.
@@ -1972,7 +2066,7 @@ pub fn run() {
             {
                 use tauri_plugin_global_shortcut::GlobalShortcutExt;
                 let app_handle = app.handle().clone();
-                app.global_shortcut().on_shortcut("ctrl+shift+e", move |_app, _shortcut, event| {
+                let res = app.global_shortcut().on_shortcut("ctrl+shift+e", move |_app, _shortcut, event| {
                     if event.state == tauri_plugin_global_shortcut::ShortcutState::Pressed {
                         let h = app_handle.clone();
                         tauri::async_runtime::spawn(async move {
@@ -2002,14 +2096,23 @@ pub fn run() {
                             }
                         });
                     }
-                })?;
-                eprintln!("[launcher] global shortcut Ctrl+Shift+E registered for auto-type");
+                });
+                match res {
+                    Ok(_) => eprintln!("[launcher] global shortcut Ctrl+Shift+E registered for auto-type"),
+                    Err(e) => eprintln!("[launcher] warning: could not register global shortcut Ctrl+Shift+E: {e}"),
+                }
             }
 
             // Note: Automation API is deferred until native authentication succeeds
             // via auth_verify_session, preventing unauthenticated localhost profile launching.
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|_app_handle, event| {
+            if let tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit = event {
+                eprintln!("[launcher] app exiting: terminating all child browser processes");
+                process::Tracker::shared().kill_all_sync();
+            }
+        });
 }

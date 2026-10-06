@@ -1,5 +1,5 @@
 import { safeInvoke } from "../../../shared/lib/tauriHelper";
-import type { ProxyEntry, ProxyTestSnapshot } from "./types";
+import type { ProxyEntry, ProxyTestSnapshot, ProxyDiagnosticResult } from "./types";
 import { parseProxyInput } from "../../../shared/lib/proxyParser";
 
 const MOCK_PROXIES_KEY = "oi_mock_proxies";
@@ -127,3 +127,7 @@ export const proxyHistory = (id: string) => safeInvoke<ProxyTestSnapshot[]>("pro
 export const proxyBulkParse = (text: string, kind: ProxyEntry["kind"]) => safeInvoke<ProxyEntry[]>("proxy_bulk_parse", { text, kind }, () => mockProxyBulkParse(text, kind));
 export const proxyBulkSave = (entries: any[]) => safeInvoke<number>("proxy_bulk_save", { entries }, () => mockProxyBulkSave(entries));
 export const proxyBulkImport = (text: string, kind: string) => safeInvoke<number>("proxy_bulk_import", { text, kind }, () => mockProxyBulkImport(text, kind));
+export const proxyDiagnose = (urlOrEntry: string, targetUrl?: string, debug?: boolean) =>
+  safeInvoke<ProxyDiagnosticResult>("proxy_diagnose", { urlOrEntry, targetUrl, debug });
+export const proxyDiagnoseBulk = (proxies: string[], targetUrl?: string, debug?: boolean, concurrency?: number) =>
+  safeInvoke<ProxyDiagnosticResult[]>("proxy_diagnose_bulk", { proxies, targetUrl, debug, concurrency });

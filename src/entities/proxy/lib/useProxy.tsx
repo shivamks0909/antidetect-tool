@@ -7,7 +7,6 @@ import { clip } from '../../../shared/lib/clipboard';
 import { confirmModal } from '../../../shared/lib/confirm';
 import { storeBus } from '../../../shared/lib/storeBus';
 import { ProfileMeta } from '../../profile/model/types';
-import { API_BASE, apiFetch } from '../../../config/api';
 
 export type ProxyInfoTarget = { proxy: ProxyEntry; anchor: { x: number; y: number } };
 
@@ -130,8 +129,6 @@ export const useProxy = create<ProxyStore>((set, get) => ({
     init: async () => {
         // защита от повторного запуска
         if (get().status === 'loading' || get().status === 'ready') return;
-        const token = localStorage.getItem("opinion_jwt_token");
-        if (!token) return;
         set({ status: 'loading' });
         try {
             const proxies = await proxyList();
@@ -164,41 +161,8 @@ export const useProxy = create<ProxyStore>((set, get) => ({
     },
     reload: async () => {
         try {
-            let proxies = await proxyList();
+            const proxies = await proxyList();
             set({ proxies, profiles: await profileList() });
-
-            // Cloud restore: pull proxies from MongoDB Atlas if not present locally
-            const token = localStorage.getItem("opinion_jwt_token");
-            if (token) {
-                try {
-                    const res = await apiFetch(`${API_BASE}/data/proxies`, {
-                        headers: { Authorization: `Bearer ${token}` },
-                    });
-                    if (res.ok) {
-                        const data = await res.json();
-                        if (Array.isArray(data.proxies) && data.proxies.length > 0) {
-                            const localIds = new Set(proxies.map((p) => p.id));
-                            let importedCount = 0;
-                            for (const cp of data.proxies) {
-                                if (cp && cp.id && !localIds.has(cp.id)) {
-                                    try {
-                                        await proxySave(cp);
-                                        importedCount++;
-                                    } catch (err) {
-                                        console.warn("[CloudSync] Failed to restore proxy:", cp.id, err);
-                                    }
-                                }
-                            }
-                            if (importedCount > 0) {
-                                proxies = await proxyList();
-                                set({ proxies });
-                            }
-                        }
-                    }
-                } catch (syncErr) {
-                    console.warn("[CloudSync] Proxy pull notice:", syncErr);
-                }
-            }
         } catch (e) { toast.err(String(e)); }
     },
     setProxies: (proxies: ProxyEntry[]) => set({ proxies }),
@@ -258,13 +222,6 @@ export const useProxy = create<ProxyStore>((set, get) => ({
         if ((await confirmModal({ title: "Delete proxy", message: "Delete this proxy?", danger: true })) !== true) return;
         try {
             await proxyDelete(id);
-            const token = localStorage.getItem("opinion_jwt_token");
-            if (token) {
-                apiFetch(`${API_BASE}/data/proxies/${id}`, {
-                    method: "DELETE",
-                    headers: { Authorization: `Bearer ${token}` },
-                }).catch(() => {});
-            }
             get().reload();
             storeBus.emit('proxies');
             toast.ok("Proxy deleted");
@@ -296,16 +253,9 @@ export const useProxy = create<ProxyStore>((set, get) => ({
         const ids = [...proxySel];
         if (ids.length === 0) return;
         if ((await confirmModal({ title: "Delete proxies", message: `Delete ${ids.length} prox${ids.length === 1 ? "y" : "ies"}?`, danger: true })) !== true) return;
-        const token = localStorage.getItem("opinion_jwt_token");
         for (const id of ids) {
             try {
                 await proxyDelete(id);
-                if (token) {
-                    apiFetch(`${API_BASE}/data/proxies/${id}`, {
-                        method: "DELETE",
-                        headers: { Authorization: `Bearer ${token}` },
-                    }).catch(() => {});
-                }
             } catch (e) { toast.err(String(e)); }
         }
         get().clearSelected();

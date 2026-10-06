@@ -43,8 +43,6 @@ export const useFingerprint = create<FingerprintStore>((set, get) => ({
 
     init: async () => {
         if (get().status === "loading" || get().status === "ready") return;
-        const token = localStorage.getItem("opinion_jwt_token");
-        if (!token) return;
         set({ status: "loading" });
         try {
             set({ items: await fingerprintList(), status: "ready" });

@@ -1,7 +1,7 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { Button, cn } from "@proxyshard/shardx-ui-kit";
+import { cn } from "@proxyshard/shardx-ui-kit";
 import Badge from "../../shared/ui/Badge";
 import {
   NavBrowsersIcon,
@@ -20,7 +20,6 @@ import type { RtUpdate, Section } from "../../shared/types";
 import { useNav } from "../../shared/model/navigation";
 import { DownloadMcp } from "../../features/DownloadMcp";
 import { ThemeSwitch } from "../../features/ThemeSwitch";
-import { useAuthStore } from "../../features/auth/model/useAuthStore";
 
 function VersionPill() {
   const [info, setInfo] = useState<RtUpdate | null>(null);
@@ -72,9 +71,6 @@ function VersionPill() {
 export function Sidebar() {
   const section = useNav((s) => s.section);
   const setSection = useNav((s) => s.setSection);
-  const user = useAuthStore((s) => s.user);
-  const profile = useAuthStore((s) => s.profile);
-  const signOut = useAuthStore((s) => s.signOut);
 
   const sections: { label: string; items: { id: Section; label: string; svg: ReactNode }[] }[] = [
     {
@@ -149,51 +145,8 @@ export function Sidebar() {
             ))}
           </div>
         ))}
-        {profile?.role === "admin" && (
-          <div className="mt-3.5 flex flex-col gap-1.5">
-            <div className="px-2 pb-1.5 text-subheading-2xs text-text-soft-400">Admin</div>
-            <button
-              className={cn(
-                "relative flex cursor-pointer items-center gap-2.5 rounded-lg border-0 px-2.5 py-[7px] text-left text-label-xs font-bold transition-colors",
-                section === "admin"
-                  ? "bg-green-100 text-green-700"
-                  : "bg-transparent text-green-700 hover:bg-green-50",
-              )}
-              onClick={() => setSection("admin")}
-            >
-              <span className="grid w-5 place-items-center text-green-700">🛡️</span>
-              <span>Admin Dashboard</span>
-            </button>
-          </div>
-        )}
       </nav>
       <div className="mt-auto border-t border-stroke-soft-200 pt-2">
-        {/* User Account Card & Logout */}
-        {user && (
-          <div className="mb-2.5 flex flex-col gap-1.5 rounded-xl bg-bg-weak-50 p-2.5 ring-1 ring-inset ring-stroke-soft-200">
-            <div className="flex items-center justify-between">
-              <span className="truncate text-label-xs font-semibold text-text-strong-950" title={user.email || ""}>
-                {profile?.full_name || user.email?.split("@")[0] || "User"}
-              </span>
-              <Badge color="primary" variant="light" size="small">
-                {profile?.role || "Active"}
-              </Badge>
-            </div>
-            <div className="truncate text-paragraph-2xs text-text-soft-400">
-              {user.email}
-            </div>
-            <Button
-              variant="neutral"
-              mode="stroke"
-              size="xsmall"
-              className="mt-1 w-full text-error-base hover:text-error-base cursor-pointer"
-              onClick={() => signOut()}
-            >
-              Log out
-            </Button>
-          </div>
-        )}
-
         <div className="mb-2.5 flex flex-col gap-[7px] rounded-xl bg-bg-weak-50 p-2.5 ring-1 ring-inset ring-stroke-soft-200">
           <div className="flex items-center justify-between">
             <span className="text-subheading-2xs text-text-soft-400">Automation API</span>

@@ -1,10 +1,17 @@
 use crate::{settings, store};
 use anyhow::{Context, Result};
+use base64::{engine::general_purpose::STANDARD, Engine as _};
+use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio::time::{timeout, Instant};
+use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -13,6 +20,294 @@ pub enum ProxyKind {
     Http,
     Https,
     Geolocation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProxyConfig {
+    pub protocol: String,
+    pub host: String,
+    pub port: u16,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
+    #[serde(default)]
+    pub source_format: Option<String>,
+    #[serde(default)]
+    pub location_label: Option<String>,
+    #[serde(default)]
+    pub raw_input: Option<String>,
+}
+
+impl ProxyConfig {
+    /// Safe string representation with credentials redacted as ****
+    pub fn to_sanitized_string(&self) -> String {
+        if self.username.is_some() || self.password.is_some() {
+            format!("{}://****:****@{}:{}", self.protocol, self.host, self.port)
+        } else {
+            format!("{}://{}:{}", self.protocol, self.host, self.port)
+        }
+    }
+
+    pub fn host_port(&self) -> String {
+        format!("{}:{}", self.host, self.port)
+    }
+
+    pub fn parse_url(raw: &str) -> std::result::Result<Self, String> {
+        let entry = parse_one(raw, &ProxyKind::Http)
+            .ok_or_else(|| "Failed to parse proxy URL".to_string())?;
+        Ok(Self::from_entry(&entry))
+    }
+
+    pub fn from_entry(entry: &ProxyEntry) -> Self {
+        let protocol = match entry.kind {
+            ProxyKind::Socks5 => "socks5",
+            ProxyKind::Http | ProxyKind::Geolocation => "http",
+            ProxyKind::Https => "https",
+        }
+        .to_string();
+        Self {
+            protocol,
+            host: entry.host.clone(),
+            port: entry.port,
+            username: if entry.username.is_empty() { None } else { Some(entry.username.clone()) },
+            password: if entry.password.is_empty() { None } else { Some(entry.password.clone()) },
+            source_format: entry.source_format.clone(),
+            location_label: entry.location_label.clone(),
+            raw_input: entry.raw_input.clone(),
+        }
+    }
+
+    pub fn to_entry(&self) -> ProxyEntry {
+        let kind = match self.source_format.as_deref() {
+            Some("geolocation") => ProxyKind::Geolocation,
+            _ => match self.protocol.to_lowercase().as_str() {
+                "socks5" => ProxyKind::Socks5,
+                "https" => ProxyKind::Https,
+                _ => ProxyKind::Http,
+            },
+        };
+        ProxyEntry {
+            id: String::new(),
+            name: format!("{}:{}", self.host, self.port),
+            kind,
+            host: self.host.clone(),
+            port: self.port,
+            username: self.username.clone().unwrap_or_default(),
+            password: self.password.clone().unwrap_or_default(),
+            country: String::new(),
+            notes: String::new(),
+            source_format: self.source_format.clone(),
+            location_label: self.location_label.clone(),
+            raw_input: self.raw_input.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ProxyErrorCategory {
+    Success,
+    InvalidProxyUrl,
+    InvalidCredentialsFormat,
+    DnsFailure,
+    TcpConnectionFailed,
+    ConnectionTimeout,
+    ProxyAuthFailed,
+    HttpProxyRequestFailed,
+    HttpsConnectFailed,
+    TlsHandshakeFailed,
+    TargetConnectionFailed,
+    TargetTimeout,
+    ConnectionReset,
+    ProxyReturned4xx,
+    ProxyReturned5xx,
+}
+
+impl ProxyErrorCategory {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Success => "SUCCESS",
+            Self::InvalidProxyUrl => "INVALID_PROXY_URL",
+            Self::InvalidCredentialsFormat => "INVALID_CREDENTIALS_FORMAT",
+            Self::DnsFailure => "DNS_FAILURE",
+            Self::TcpConnectionFailed => "TCP_CONNECTION_FAILED",
+            Self::ConnectionTimeout => "CONNECTION_TIMEOUT",
+            Self::ProxyAuthFailed => "PROXY_AUTH_FAILED",
+            Self::HttpProxyRequestFailed => "HTTP_PROXY_REQUEST_FAILED",
+            Self::HttpsConnectFailed => "HTTPS_CONNECT_FAILED",
+            Self::TlsHandshakeFailed => "TLS_HANDSHAKE_FAILED",
+            Self::TargetConnectionFailed => "TARGET_CONNECTION_FAILED",
+            Self::TargetTimeout => "TARGET_TIMEOUT",
+            Self::ConnectionReset => "CONNECTION_RESET",
+            Self::ProxyReturned4xx => "PROXY_RETURNED_4XX",
+            Self::ProxyReturned5xx => "PROXY_RETURNED_5XX",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProxyTestResult {
+    pub proxy_id: String,
+    pub success: bool,
+    pub protocol: String,
+    pub host_port: String,
+    pub latency_ms: Option<u64>,
+    pub total_time_ms: Option<u64>,
+    pub error_category: ProxyErrorCategory,
+    pub status_code: Option<u16>,
+    pub test_type: String,
+    pub tested_at: String,
+    pub retry_count: u32,
+    pub details: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProxyTimeouts {
+    pub tcp_connect_ms: u64,
+    pub auth_handshake_ms: u64,
+    pub connect_tunnel_ms: u64,
+    pub tls_handshake_ms: u64,
+    pub target_response_ms: u64,
+}
+
+impl Default for ProxyTimeouts {
+    fn default() -> Self {
+        Self {
+            tcp_connect_ms: 5000,
+            auth_handshake_ms: 8000,
+            connect_tunnel_ms: 8000,
+            tls_handshake_ms: 8000,
+            target_response_ms: 10000,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ProxyHealthState {
+    Healthy,
+    TemporarilyFailed,
+    AuthFailed,
+    Dead,
+    Cooldown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProxyHealth {
+    pub proxy_id: String,
+    pub state: ProxyHealthState,
+    pub consecutive_failures: u32,
+    pub last_tested_at: Option<String>,
+    pub last_success_at: Option<String>,
+    pub cooldown_until_unix: Option<u64>,
+    pub last_error: Option<ProxyErrorCategory>,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct ProxyPool {
+    proxies: Vec<ProxyEntry>,
+    health_map: HashMap<String, ProxyHealth>,
+    cursor: usize,
+}
+
+impl ProxyPool {
+    pub fn new(proxies: Vec<ProxyEntry>) -> Self {
+        let mut health_map = HashMap::new();
+        for p in &proxies {
+            health_map.insert(
+                p.id.clone(),
+                ProxyHealth {
+                    proxy_id: p.id.clone(),
+                    state: ProxyHealthState::Healthy,
+                    consecutive_failures: 0,
+                    last_tested_at: None,
+                    last_success_at: None,
+                    cooldown_until_unix: None,
+                    last_error: None,
+                },
+            );
+        }
+        Self {
+            proxies,
+            health_map,
+            cursor: 0,
+        }
+    }
+
+    pub fn get_next_healthy(&mut self, now_unix: u64) -> Option<ProxyEntry> {
+        if self.proxies.is_empty() {
+            return None;
+        }
+        let total = self.proxies.len();
+        for _ in 0..total {
+            let idx = self.cursor % total;
+            self.cursor = (self.cursor + 1) % total;
+            let candidate = &self.proxies[idx];
+            if let Some(h) = self.health_map.get_mut(&candidate.id) {
+                if h.state == ProxyHealthState::Cooldown {
+                    if let Some(until) = h.cooldown_until_unix {
+                        if now_unix >= until {
+                            h.state = ProxyHealthState::TemporarilyFailed;
+                        }
+                    }
+                }
+                if matches!(h.state, ProxyHealthState::Healthy | ProxyHealthState::TemporarilyFailed) {
+                    return Some(candidate.clone());
+                }
+            }
+        }
+        None
+    }
+
+    pub fn record_result(&mut self, proxy_id: &str, result: &ProxyTestResult, now_unix: u64) {
+        if let Some(h) = self.health_map.get_mut(proxy_id) {
+            h.last_tested_at = Some(result.tested_at.clone());
+            if result.success {
+                h.state = ProxyHealthState::Healthy;
+                h.consecutive_failures = 0;
+                h.cooldown_until_unix = None;
+                h.last_success_at = Some(result.tested_at.clone());
+                h.last_error = None;
+            } else {
+                h.last_error = Some(result.error_category);
+                match result.error_category {
+                    ProxyErrorCategory::ProxyAuthFailed => {
+                        h.state = ProxyHealthState::AuthFailed;
+                    }
+                    ProxyErrorCategory::TargetTimeout | ProxyErrorCategory::TargetConnectionFailed => {
+                        h.state = ProxyHealthState::TemporarilyFailed;
+                        h.cooldown_until_unix = Some(now_unix + 5);
+                    }
+                    _ => {
+                        h.consecutive_failures += 1;
+                        if h.consecutive_failures >= 5 {
+                            h.state = ProxyHealthState::Dead;
+                        } else {
+                            h.state = ProxyHealthState::Cooldown;
+                            let backoff = std::cmp::min(300, 5 * (2u64.pow(h.consecutive_failures - 1)));
+                            h.cooldown_until_unix = Some(now_unix + backoff);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn evict(&mut self, proxy_id: &str) {
+        self.proxies.retain(|p| p.id != proxy_id);
+        self.health_map.remove(proxy_id);
+    }
+
+    pub fn reset_pool(&mut self) {
+        for h in self.health_map.values_mut() {
+            if h.state != ProxyHealthState::Dead && h.state != ProxyHealthState::AuthFailed {
+                h.state = ProxyHealthState::Healthy;
+                h.consecutive_failures = 0;
+                h.cooldown_until_unix = None;
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -34,6 +329,8 @@ pub struct ProxyEntry {
     #[serde(default)]
     pub notes: String,
     #[serde(default)]
+    pub source_format: Option<String>,
+    #[serde(default)]
     pub location_label: Option<String>,
     #[serde(default)]
     pub raw_input: Option<String>,
@@ -42,9 +339,7 @@ pub struct ProxyEntry {
 impl ProxyEntry {
     /// Build `--proxy-server=<scheme>://[user:pass@]host:port`.
     /// SOCKS5: credentials embedded in URL (Chromium handles natively).
-    /// HTTP/HTTPS/Geolocation: credentials stripped — use CDP Fetch domain for auth
-    /// (Chrome ignores user:pass in --proxy-server URL for HTTP(S) proxies
-    /// and shows a native auth popup instead).
+    /// HTTP/HTTPS/Geolocation: credentials stripped — use CDP Fetch domain for auth.
     pub fn to_proxy_server_arg(&self) -> String {
         let scheme = match self.kind {
             ProxyKind::Socks5 => "socks5",
@@ -53,8 +348,6 @@ impl ProxyEntry {
         };
         let host_port = format!("{}:{}", self.host, self.port);
 
-        // Only embed credentials for SOCKS5 — Chromium handles SOCKS5 auth
-        // natively via the URL. For HTTP/HTTPS, CDP Fetch domain handles auth.
         if matches!(self.kind, ProxyKind::Socks5)
             && (!self.username.is_empty() || !self.password.is_empty())
         {
@@ -72,18 +365,141 @@ impl ProxyEntry {
     pub fn has_credentials(&self) -> bool {
         !self.username.is_empty() || !self.password.is_empty()
     }
+
+    pub fn to_config(&self) -> ProxyConfig {
+        ProxyConfig {
+            protocol: match self.kind {
+                ProxyKind::Socks5 => "socks5".to_string(),
+                ProxyKind::Http | ProxyKind::Geolocation => "http".to_string(),
+                ProxyKind::Https => "https".to_string(),
+            },
+            host: self.host.clone(),
+            port: self.port,
+            username: if self.username.is_empty() { None } else { Some(self.username.clone()) },
+            password: if self.password.is_empty() { None } else { Some(self.password.clone()) },
+            source_format: self.source_format.clone(),
+            location_label: self.location_label.clone(),
+            raw_input: self.raw_input.clone(),
+        }
+    }
+
+    pub fn host_port(&self) -> String {
+        format!("{}:{}", self.host, self.port)
+    }
+
+    pub fn sanitized_label(&self) -> String {
+        format!("{}:{}", self.host, self.port)
+    }
+}
+
+impl Default for ProxyEntry {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            name: String::new(),
+            kind: ProxyKind::Http,
+            host: String::new(),
+            port: 8080,
+            username: String::new(),
+            password: String::new(),
+            country: String::new(),
+            notes: String::new(),
+            source_format: None,
+            location_label: None,
+            raw_input: None,
+        }
+    }
+}
+
+// ---- Profile-Scoped Runtime Proxy Authentication Extension ----
+/// Subdirectory name inside `<udd>` where the ephemeral proxy authentication extension resides.
+pub const PROXY_AUTH_EXT_DIR: &str = "proxy_auth_ext";
+
+/// Generate or refresh a profile-scoped Manifest V3 extension in `<udd>/proxy_auth_ext`
+/// that answers proxy 407 authentication challenges synchronously via `chrome.webRequest.onAuthRequired`.
+/// This supplies credentials at the Chromium network layer with zero native "Sign in" popup.
+pub fn create_proxy_auth_extension(udd: &Path, proxy: &ProxyEntry) -> Result<PathBuf> {
+    let ext_dir = udd.join(PROXY_AUTH_EXT_DIR);
+    fs::create_dir_all(&ext_dir).context("failed to create proxy auth extension directory")?;
+
+    let manifest = serde_json::json!({
+        "name": "Proxy Authentication Handler",
+        "version": "1.0.0",
+        "manifest_version": 3,
+        "permissions": [
+            "webRequest",
+            "webRequestAuthProvider"
+        ],
+        "host_permissions": [
+            "<all_urls>"
+        ],
+        "background": {
+            "service_worker": "background.js"
+        }
+    });
+
+    let manifest_body = serde_json::to_string_pretty(&manifest)?;
+    fs::write(ext_dir.join("manifest.json"), manifest_body)
+        .context("failed to write proxy auth manifest.json")?;
+
+    let u_json = serde_json::to_string(&proxy.username).unwrap_or_else(|_| "\"\"".into());
+    let p_json = serde_json::to_string(&proxy.password).unwrap_or_else(|_| "\"\"".into());
+    let h_json = serde_json::to_string(&proxy.host).unwrap_or_else(|_| "\"\"".into());
+
+    let background_js = format!(
+        r#"// Profile-scoped proxy authentication handler
+const USERNAME = {u_json};
+const PASSWORD = {p_json};
+const PROXY_HOST = {h_json};
+
+let attempts = 0;
+
+chrome.webRequest.onAuthRequired.addListener(
+  function(details, asyncCallback) {{
+    if (details.isProxy) {{
+      attempts++;
+      if (attempts > 3) {{
+        // Cancel challenge if proxy authentication keeps failing, blocking the modal popup
+        asyncCallback({{ cancel: true }});
+        return;
+      }}
+      asyncCallback({{
+        authCredentials: {{
+          username: USERNAME,
+          password: PASSWORD
+        }}
+      }});
+    }} else {{
+      asyncCallback({{}});
+    }}
+  }},
+  {{ urls: ["<all_urls>"] }},
+  ["asyncBlocking"]
+);
+"#
+    );
+
+    fs::write(ext_dir.join("background.js"), background_js)
+        .context("failed to write proxy auth background.js")?;
+
+    Ok(ext_dir)
+}
+
+/// Remove the ephemeral proxy authentication extension if proxy credentials are no longer needed.
+pub fn remove_proxy_auth_extension(udd: &Path) -> Result<()> {
+    let ext_dir = udd.join(PROXY_AUTH_EXT_DIR);
+    if ext_dir.exists() {
+        let _ = fs::remove_dir_all(&ext_dir);
+    }
+    Ok(())
 }
 
 // ---- CDP Fetch-domain proxy authentication ----
 // When Chromium hits a 407 from an HTTP/HTTPS proxy, it fires a
-// Fetch.authRequired CDP event.  We answer with stored credentials so
+// Fetch.authRequired CDP event. We answer with stored credentials so
 // the user never sees the native auth popup.
 //
-// For SOCKS5, credentials live in the --proxy-server URL (handled by
-// Chromium natively), so this handler is skipped.
-
-use tokio_tungstenite::{connect_async, tungstenite::Message};
-use futures_util::{SinkExt, StreamExt};
+// Uses Target.setAutoAttach (flatten: true) so all tabs / frames receive Fetch.enable.
 
 /// Spawn a long-lived CDP event loop that answers proxy auth challenges.
 /// Non-blocking: the handler runs on the Tokio runtime.
@@ -101,13 +517,31 @@ async fn proxy_auth_loop(ws_url: &str, proxy: &ProxyEntry) -> Result<()> {
         .context("failed to connect to CDP for proxy auth")?;
     let (mut tx, mut rx) = ws.split();
 
-    // Enable Fetch domain — handleAuthRequests fires Fetch.authRequired
-    // on proxy 407; no patterns means only auth events, no request pausing.
+    // Enable Fetch domain on root target with patterns: [] so ordinary network traffic is never paused
     tx.send(Message::Text(
         serde_json::json!({
             "id": 1,
             "method": "Fetch.enable",
-            "params": { "handleAuthRequests": true }
+            "params": {
+                "patterns": [],
+                "handleAuthRequests": true
+            }
+        })
+        .to_string()
+        .into(),
+    ))
+    .await?;
+
+    // Enable auto-attach across all pages, frames, and workers with flatten: true
+    tx.send(Message::Text(
+        serde_json::json!({
+            "id": 2,
+            "method": "Target.setAutoAttach",
+            "params": {
+                "autoAttach": true,
+                "waitForDebuggerOnStart": false,
+                "flatten": true
+            }
         })
         .to_string()
         .into(),
@@ -116,7 +550,9 @@ async fn proxy_auth_loop(ws_url: &str, proxy: &ProxyEntry) -> Result<()> {
 
     eprintln!("[proxy-auth] handler started for {}:{}", proxy.host, proxy.port);
 
-    let mut next_id = 2u32;
+    let mut next_id = 3u32;
+    let mut auth_attempts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+
     while let Some(Ok(msg)) = rx.next().await {
         if let Message::Text(text) = msg {
             let v: serde_json::Value = match serde_json::from_str(&text) {
@@ -124,30 +560,64 @@ async fn proxy_auth_loop(ws_url: &str, proxy: &ProxyEntry) -> Result<()> {
                 Err(_) => continue,
             };
 
-            if v["method"] == "Fetch.authRequired" {
-                let req_id = v["params"]["requestId"].as_str().unwrap_or("");
-                eprintln!("[proxy-auth] auth challenge for request {req_id}");
-                let resp = serde_json::json!({
+            let session_id = v.get("sessionId").and_then(|s| s.as_str());
+
+            if v["method"] == "Target.attachedToTarget" {
+                if let Some(sid) = v["params"]["sessionId"].as_str() {
+                    let req = serde_json::json!({
+                        "id": next_id,
+                        "sessionId": sid,
+                        "method": "Fetch.enable",
+                        "params": {
+                            "patterns": [],
+                            "handleAuthRequests": true
+                        }
+                    });
+                    next_id += 1;
+                    let _ = tx.send(Message::Text(req.to_string().into())).await;
+                }
+            } else if v["method"] == "Fetch.authRequired" {
+                let req_id = v["params"]["requestId"].as_str().unwrap_or("").to_string();
+                let attempts = auth_attempts.entry(req_id.clone()).or_insert(0);
+                *attempts += 1;
+
+                let auth_response = if *attempts > 3 {
+                    eprintln!("[proxy-auth] auth failed/looping ({attempts} attempts) for {req_id}; canceling challenge to block popup dialog");
+                    serde_json::json!({
+                        "response": "CancelAuth"
+                    })
+                } else {
+                    eprintln!("[proxy-auth] answering auth challenge for request {req_id} (attempt {attempts})");
+                    serde_json::json!({
+                        "response": "ProvideCredentials",
+                        "username": proxy.username,
+                        "password": proxy.password
+                    })
+                };
+
+                let mut resp = serde_json::json!({
                     "id": next_id,
                     "method": "Fetch.continueWithAuth",
                     "params": {
                         "requestId": req_id,
-                        "authChallengeResponse": {
-                            "response": "ProvideCredentials",
-                            "username": proxy.username,
-                            "password": proxy.password
-                        }
+                        "authChallengeResponse": auth_response
                     }
                 });
+                if let Some(sid) = session_id {
+                    resp["sessionId"] = serde_json::Value::String(sid.to_string());
+                }
                 next_id += 1;
                 let _ = tx.send(Message::Text(resp.to_string().into())).await;
             } else if v["method"] == "Fetch.requestPaused" {
                 let req_id = v["params"]["requestId"].as_str().unwrap_or("");
-                let resp = serde_json::json!({
+                let mut resp = serde_json::json!({
                     "id": next_id,
                     "method": "Fetch.continueRequest",
                     "params": { "requestId": req_id }
                 });
+                if let Some(sid) = session_id {
+                    resp["sessionId"] = serde_json::Value::String(sid.to_string());
+                }
                 next_id += 1;
                 let _ = tx.send(Message::Text(resp.to_string().into())).await;
             }
@@ -219,7 +689,6 @@ pub fn delete(id: &str) -> Result<()> {
     let mut s = load()?;
     s.proxies.retain(|p| p.id != id);
     save(&s)?;
-    // Also wipe persisted test history.
     let mut hs = load_history()?;
     if hs.by_proxy.remove(id).is_some() {
         save_history(&hs)?;
@@ -233,10 +702,6 @@ pub fn get(id: &str) -> Result<Option<ProxyEntry>> {
 
 /// SOCKS5/HTTP CONNECT probe; returns RTT in ms on success.
 pub async fn probe(entry: &ProxyEntry) -> Result<u128> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpStream;
-    use tokio::time::{timeout, Duration, Instant};
-
     let started = Instant::now();
     let addr = format!("{}:{}", entry.host, entry.port);
     let mut stream = timeout(Duration::from_secs(8), TcpStream::connect(&addr))
@@ -245,7 +710,6 @@ pub async fn probe(entry: &ProxyEntry) -> Result<u128> {
 
     match entry.kind {
         ProxyKind::Socks5 => {
-            // RFC 1928 §3 greeting
             let auth_method: u8 = if entry.username.is_empty() { 0x00 } else { 0x02 };
             stream.write_all(&[0x05, 0x01, auth_method]).await?;
             let mut resp = [0u8; 2];
@@ -257,7 +721,6 @@ pub async fn probe(entry: &ProxyEntry) -> Result<u128> {
                 anyhow::bail!("no acceptable auth method");
             }
             if auth_method == 0x02 {
-                // RFC 1929 user/pass sub-negotiation
                 let mut buf = vec![0x01u8];
                 buf.push(entry.username.len() as u8);
                 buf.extend_from_slice(entry.username.as_bytes());
@@ -272,8 +735,6 @@ pub async fn probe(entry: &ProxyEntry) -> Result<u128> {
             }
         }
         ProxyKind::Http | ProxyKind::Https | ProxyKind::Geolocation => {
-            // CONNECT with Basic auth; read until CRLFCRLF to avoid clipping headers.
-            use base64::{engine::general_purpose::STANDARD, Engine as _};
             let mut req = String::from(
                 "CONNECT example.com:443 HTTP/1.1\r\n\
                  Host: example.com:443\r\n",
@@ -286,7 +747,6 @@ pub async fn probe(entry: &ProxyEntry) -> Result<u128> {
             req.push_str("Proxy-Connection: keep-alive\r\n\r\n");
             stream.write_all(req.as_bytes()).await?;
 
-            // Read until CRLFCRLF or 4 KB cap.
             let mut buf = Vec::with_capacity(512);
             let mut tmp = [0u8; 256];
             let head: String = loop {
@@ -308,14 +768,731 @@ pub async fn probe(entry: &ProxyEntry) -> Result<u128> {
     Ok(started.elapsed().as_millis())
 }
 
-// ---- Bulk import ----
-//
-// Accepted: socks5://user:pass@host:port, user:pass@host:port, host:port:user:pass,
-//           host:port@user:pass, host:port. A trailing `#` is the proxy's name
-//           (`#facebook`); `country=X` and `note=Y` there are still read, for
-//           lines exported by older builds, but the country a proxy reports is
-//           filled in by its test. Whole-line `#` comments are skipped.
-//           SOCKS5 when no scheme given.
+// ---- Multi-Stage Diagnostic Layer ----
+
+/// Complete multi-stage proxy diagnostic runner with failure classification
+pub async fn diagnose_proxy(
+    entry: &ProxyEntry,
+    target_url: &str,
+    timeouts: &ProxyTimeouts,
+    debug: bool,
+    proxy_index: Option<usize>,
+) -> ProxyTestResult {
+    let tested_at = unix_now();
+    let idx_label = proxy_index
+        .map(|i| format!("[proxy #{i}] "))
+        .unwrap_or_else(|| "[proxy] ".to_string());
+    let host_port = format!("{}:{}", entry.host, entry.port);
+    let proto_str = match entry.kind {
+        ProxyKind::Socks5 => "socks5",
+        ProxyKind::Http | ProxyKind::Geolocation => "http",
+        ProxyKind::Https => "https",
+    }
+    .to_string();
+
+    let start_total = Instant::now();
+
+    // 0. Parameter and URL validation
+    if entry.host.trim().is_empty() || entry.port == 0 {
+        if debug {
+            eprintln!("{idx_label}{host_port}\n{idx_label}error: INVALID_PROXY_URL");
+        }
+        return ProxyTestResult {
+            proxy_id: entry.id.clone(),
+            success: false,
+            protocol: proto_str,
+            host_port,
+            latency_ms: None,
+            total_time_ms: Some(start_total.elapsed().as_millis() as u64),
+            error_category: ProxyErrorCategory::InvalidProxyUrl,
+            status_code: None,
+            test_type: "VALIDATION".into(),
+            tested_at,
+            retry_count: 0,
+            details: Some("Proxy host cannot be empty and port must be between 1 and 65535".into()),
+        };
+    }
+
+    if debug {
+        eprintln!("{idx_label}{host_port}");
+    }
+
+    // 1. DNS Resolution Stage
+    let addr_str = format!("{}:{}", entry.host, entry.port);
+    let socket_addrs = match tokio::net::lookup_host(&addr_str).await {
+        Ok(addrs) => addrs.collect::<Vec<_>>(),
+        Err(e) => {
+            if debug {
+                eprintln!("{idx_label}DNS resolution: FAILED\n{idx_label}error: DNS_FAILURE");
+            }
+            return ProxyTestResult {
+                proxy_id: entry.id.clone(),
+                success: false,
+                protocol: proto_str,
+                host_port,
+                latency_ms: None,
+                total_time_ms: Some(start_total.elapsed().as_millis() as u64),
+                error_category: ProxyErrorCategory::DnsFailure,
+                status_code: None,
+                test_type: "DNS".into(),
+                tested_at,
+                retry_count: 0,
+                details: Some(format!("DNS resolution failed for host: {e}")),
+            };
+        }
+    };
+
+    if socket_addrs.is_empty() {
+        if debug {
+            eprintln!("{idx_label}DNS resolution: FAILED (no IP resolved)\n{idx_label}error: DNS_FAILURE");
+        }
+        return ProxyTestResult {
+            proxy_id: entry.id.clone(),
+            success: false,
+            protocol: proto_str,
+            host_port,
+            latency_ms: None,
+            total_time_ms: Some(start_total.elapsed().as_millis() as u64),
+            error_category: ProxyErrorCategory::DnsFailure,
+            status_code: None,
+            test_type: "DNS".into(),
+            tested_at,
+            retry_count: 0,
+            details: Some("DNS resolution returned empty address list".into()),
+        };
+    }
+
+    // 2. TCP Connectivity Stage
+    let tcp_start = Instant::now();
+    let tcp_stream = match timeout(
+        Duration::from_millis(timeouts.tcp_connect_ms),
+        TcpStream::connect(&socket_addrs[..]),
+    )
+    .await
+    {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
+            if debug {
+                eprintln!("{idx_label}TCP connection: FAILED ({e})\n{idx_label}error: TCP_CONNECTION_FAILED");
+            }
+            return ProxyTestResult {
+                proxy_id: entry.id.clone(),
+                success: false,
+                protocol: proto_str,
+                host_port,
+                latency_ms: None,
+                total_time_ms: Some(start_total.elapsed().as_millis() as u64),
+                error_category: ProxyErrorCategory::TcpConnectionFailed,
+                status_code: None,
+                test_type: "TCP".into(),
+                tested_at,
+                retry_count: 0,
+                details: Some(format!("TCP connect failed: {e}")),
+            };
+        }
+        Err(_) => {
+            if debug {
+                eprintln!("{idx_label}TCP connection: TIMEOUT\n{idx_label}error: CONNECTION_TIMEOUT");
+            }
+            return ProxyTestResult {
+                proxy_id: entry.id.clone(),
+                success: false,
+                protocol: proto_str,
+                host_port,
+                latency_ms: None,
+                total_time_ms: Some(start_total.elapsed().as_millis() as u64),
+                error_category: ProxyErrorCategory::ConnectionTimeout,
+                status_code: None,
+                test_type: "TCP".into(),
+                tested_at,
+                retry_count: 0,
+                details: Some(format!("TCP connect timed out after {}ms", timeouts.tcp_connect_ms)),
+            };
+        }
+    };
+    let tcp_latency = tcp_start.elapsed().as_millis() as u64;
+    if debug {
+        eprintln!("{idx_label}TCP connection: OK");
+    }
+
+    // Resolve target URL attributes
+    let target = if target_url.trim().is_empty() {
+        "https://example.com/"
+    } else {
+        target_url.trim()
+    };
+    let parsed_target = url::Url::parse(target).unwrap_or_else(|_| url::Url::parse("https://example.com/").unwrap());
+    let target_host = parsed_target.host_str().unwrap_or("example.com");
+    let target_port = parsed_target.port_or_known_default().unwrap_or(443);
+    let is_https = parsed_target.scheme() == "https";
+
+    // 3. Handshake & Tunnel Authentication Stage
+    let mut stream = tcp_stream;
+    if matches!(entry.kind, ProxyKind::Socks5) {
+        let auth_method: u8 = if entry.username.is_empty() { 0x00 } else { 0x02 };
+        if let Err(e) = stream.write_all(&[0x05, 0x01, auth_method]).await {
+            return ProxyTestResult {
+                proxy_id: entry.id.clone(),
+                success: false,
+                protocol: proto_str,
+                host_port,
+                latency_ms: Some(tcp_latency),
+                total_time_ms: Some(start_total.elapsed().as_millis() as u64),
+                error_category: ProxyErrorCategory::ConnectionReset,
+                status_code: None,
+                test_type: "SOCKS5_GREETING".into(),
+                tested_at,
+                retry_count: 0,
+                details: Some(format!("Failed to write SOCKS5 greeting: {e}")),
+            };
+        }
+        let mut resp = [0u8; 2];
+        match timeout(Duration::from_millis(timeouts.auth_handshake_ms), stream.read_exact(&mut resp)).await {
+            Ok(Ok(_)) => {
+                if resp[0] != 0x05 || resp[1] == 0xFF {
+                    if debug {
+                        eprintln!("{idx_label}authentication: FAILED\n{idx_label}error: PROXY_AUTH_FAILED");
+                    }
+                    return ProxyTestResult {
+                        proxy_id: entry.id.clone(),
+                        success: false,
+                        protocol: proto_str,
+                        host_port,
+                        latency_ms: Some(tcp_latency),
+                        total_time_ms: Some(start_total.elapsed().as_millis() as u64),
+                        error_category: ProxyErrorCategory::ProxyAuthFailed,
+                        status_code: None,
+                        test_type: "SOCKS5_AUTH".into(),
+                        tested_at,
+                        retry_count: 0,
+                        details: Some("No acceptable authentication method supported by proxy".into()),
+                    };
+                }
+            }
+            Ok(Err(e)) => {
+                return ProxyTestResult {
+                    proxy_id: entry.id.clone(),
+                    success: false,
+                    protocol: proto_str,
+                    host_port,
+                    latency_ms: Some(tcp_latency),
+                    total_time_ms: Some(start_total.elapsed().as_millis() as u64),
+                    error_category: ProxyErrorCategory::ConnectionReset,
+                    status_code: None,
+                    test_type: "SOCKS5_GREETING".into(),
+                    tested_at,
+                    retry_count: 0,
+                    details: Some(format!("SOCKS5 greeting read error: {e}")),
+                };
+            }
+            Err(_) => {
+                return ProxyTestResult {
+                    proxy_id: entry.id.clone(),
+                    success: false,
+                    protocol: proto_str,
+                    host_port,
+                    latency_ms: Some(tcp_latency),
+                    total_time_ms: Some(start_total.elapsed().as_millis() as u64),
+                    error_category: ProxyErrorCategory::ConnectionTimeout,
+                    status_code: None,
+                    test_type: "SOCKS5_GREETING".into(),
+                    tested_at,
+                    retry_count: 0,
+                    details: Some("SOCKS5 greeting read timed out".into()),
+                };
+            }
+        }
+        if auth_method == 0x02 {
+            let mut buf = vec![0x01u8];
+            buf.push(entry.username.len() as u8);
+            buf.extend_from_slice(entry.username.as_bytes());
+            buf.push(entry.password.len() as u8);
+            buf.extend_from_slice(entry.password.as_bytes());
+            let _ = stream.write_all(&buf).await;
+            let mut ar = [0u8; 2];
+            match timeout(Duration::from_millis(timeouts.auth_handshake_ms), stream.read_exact(&mut ar)).await {
+                Ok(Ok(_)) => {
+                    if ar[1] != 0x00 {
+                        if debug {
+                            eprintln!("{idx_label}authentication: FAILED\n{idx_label}error: PROXY_AUTH_FAILED");
+                        }
+                        return ProxyTestResult {
+                            proxy_id: entry.id.clone(),
+                            success: false,
+                            protocol: proto_str,
+                            host_port,
+                            latency_ms: Some(tcp_latency),
+                            total_time_ms: Some(start_total.elapsed().as_millis() as u64),
+                            error_category: ProxyErrorCategory::ProxyAuthFailed,
+                            status_code: None,
+                            test_type: "SOCKS5_AUTH".into(),
+                            tested_at,
+                            retry_count: 0,
+                            details: Some("SOCKS5 user/pass authentication rejected".into()),
+                        };
+                    }
+                }
+                Ok(Err(e)) => {
+                    return ProxyTestResult {
+                        proxy_id: entry.id.clone(),
+                        success: false,
+                        protocol: proto_str,
+                        host_port,
+                        latency_ms: Some(tcp_latency),
+                        total_time_ms: Some(start_total.elapsed().as_millis() as u64),
+                        error_category: ProxyErrorCategory::ConnectionReset,
+                        status_code: None,
+                        test_type: "SOCKS5_AUTH".into(),
+                        tested_at,
+                        retry_count: 0,
+                        details: Some(format!("SOCKS5 auth read error: {e}")),
+                    };
+                }
+                Err(_) => {
+                    return ProxyTestResult {
+                        proxy_id: entry.id.clone(),
+                        success: false,
+                        protocol: proto_str,
+                        host_port,
+                        latency_ms: Some(tcp_latency),
+                        total_time_ms: Some(start_total.elapsed().as_millis() as u64),
+                        error_category: ProxyErrorCategory::ConnectionTimeout,
+                        status_code: None,
+                        test_type: "SOCKS5_AUTH".into(),
+                        tested_at,
+                        retry_count: 0,
+                        details: Some("SOCKS5 auth read timed out".into()),
+                    };
+                }
+            }
+        }
+        if debug {
+            eprintln!("{idx_label}authentication: OK");
+            eprintln!("{idx_label}CONNECT: OK");
+        }
+    } else {
+        // HTTP / HTTPS / Geolocation CONNECT tunnel probe
+        let mut req = format!("CONNECT {target_host}:{target_port} HTTP/1.1\r\nHost: {target_host}:{target_port}\r\n");
+        if !entry.username.is_empty() || !entry.password.is_empty() {
+            let creds = format!("{}:{}", entry.username, entry.password);
+            let encoded = STANDARD.encode(creds.as_bytes());
+            req.push_str(&format!("Proxy-Authorization: Basic {encoded}\r\n"));
+        }
+        req.push_str("Proxy-Connection: keep-alive\r\n\r\n");
+        if let Err(e) = stream.write_all(req.as_bytes()).await {
+            return ProxyTestResult {
+                proxy_id: entry.id.clone(),
+                success: false,
+                protocol: proto_str,
+                host_port,
+                latency_ms: Some(tcp_latency),
+                total_time_ms: Some(start_total.elapsed().as_millis() as u64),
+                error_category: ProxyErrorCategory::ConnectionReset,
+                status_code: None,
+                test_type: "CONNECT".into(),
+                tested_at,
+                retry_count: 0,
+                details: Some(format!("Write CONNECT failed: {e}")),
+            };
+        }
+
+        let mut buf = Vec::with_capacity(512);
+        let mut tmp = [0u8; 256];
+        let head_res = loop {
+            match timeout(Duration::from_millis(timeouts.connect_tunnel_ms), stream.read(&mut tmp)).await {
+                Ok(Ok(n)) => {
+                    if n == 0 {
+                        break Ok(String::from_utf8_lossy(&buf).to_string());
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                    if buf.windows(4).any(|w| w == b"\r\n\r\n") || buf.len() > 4096 {
+                        break Ok(String::from_utf8_lossy(&buf).to_string());
+                    }
+                }
+                Ok(Err(_)) => break Err(ProxyErrorCategory::ConnectionReset),
+                Err(_) => break Err(ProxyErrorCategory::ConnectionTimeout),
+            }
+        };
+
+        let head = match head_res {
+            Ok(h) => h,
+            Err(cat) => {
+                if debug {
+                    eprintln!("{idx_label}CONNECT: FAILED\n{idx_label}error: {}", cat.as_str());
+                }
+                return ProxyTestResult {
+                    proxy_id: entry.id.clone(),
+                    success: false,
+                    protocol: proto_str,
+                    host_port,
+                    latency_ms: Some(tcp_latency),
+                    total_time_ms: Some(start_total.elapsed().as_millis() as u64),
+                    error_category: cat,
+                    status_code: None,
+                    test_type: "CONNECT".into(),
+                    tested_at,
+                    retry_count: 0,
+                    details: Some("Failed to read CONNECT response headers".into()),
+                };
+            }
+        };
+
+        let first_line = head.lines().next().unwrap_or("").trim();
+        let status_code: Option<u16> = first_line.split_whitespace().nth(1).and_then(|s| s.parse().ok());
+
+        if let Some(code) = status_code {
+            if code == 407 {
+                if debug {
+                    eprintln!("{idx_label}authentication: FAILED\n{idx_label}error: PROXY_AUTH_FAILED");
+                }
+                return ProxyTestResult {
+                    proxy_id: entry.id.clone(),
+                    success: false,
+                    protocol: proto_str,
+                    host_port,
+                    latency_ms: Some(tcp_latency),
+                    total_time_ms: Some(start_total.elapsed().as_millis() as u64),
+                    error_category: ProxyErrorCategory::ProxyAuthFailed,
+                    status_code: Some(407),
+                    test_type: "CONNECT".into(),
+                    tested_at,
+                    retry_count: 0,
+                    details: Some("HTTP 407 Proxy Authentication Required".into()),
+                };
+            } else if code == 403 {
+                if debug {
+                    eprintln!("{idx_label}authentication: FAILED\n{idx_label}error: PROXY_AUTH_FAILED");
+                }
+                return ProxyTestResult {
+                    proxy_id: entry.id.clone(),
+                    success: false,
+                    protocol: proto_str,
+                    host_port,
+                    latency_ms: Some(tcp_latency),
+                    total_time_ms: Some(start_total.elapsed().as_millis() as u64),
+                    error_category: ProxyErrorCategory::ProxyAuthFailed,
+                    status_code: Some(403),
+                    test_type: "CONNECT".into(),
+                    tested_at,
+                    retry_count: 0,
+                    details: Some("HTTP 403 Forbidden by proxy administrative rules".into()),
+                };
+            } else if code >= 400 && code < 500 {
+                if debug {
+                    eprintln!("{idx_label}CONNECT: FAILED (HTTP {code})\n{idx_label}error: PROXY_RETURNED_4XX");
+                }
+                return ProxyTestResult {
+                    proxy_id: entry.id.clone(),
+                    success: false,
+                    protocol: proto_str,
+                    host_port,
+                    latency_ms: Some(tcp_latency),
+                    total_time_ms: Some(start_total.elapsed().as_millis() as u64),
+                    error_category: ProxyErrorCategory::ProxyReturned4xx,
+                    status_code: Some(code),
+                    test_type: "CONNECT".into(),
+                    tested_at,
+                    retry_count: 0,
+                    details: Some(format!("Proxy returned HTTP {code}")),
+                };
+            } else if code >= 500 {
+                if debug {
+                    eprintln!("{idx_label}CONNECT: FAILED (HTTP {code})\n{idx_label}error: PROXY_RETURNED_5XX");
+                }
+                return ProxyTestResult {
+                    proxy_id: entry.id.clone(),
+                    success: false,
+                    protocol: proto_str,
+                    host_port,
+                    latency_ms: Some(tcp_latency),
+                    total_time_ms: Some(start_total.elapsed().as_millis() as u64),
+                    error_category: ProxyErrorCategory::ProxyReturned5xx,
+                    status_code: Some(code),
+                    test_type: "CONNECT".into(),
+                    tested_at,
+                    retry_count: 0,
+                    details: Some(format!("Proxy returned HTTP {code}")),
+                };
+            } else if code != 200 {
+                if debug {
+                    eprintln!("{idx_label}CONNECT: FAILED (status {code})\n{idx_label}error: HTTPS_CONNECT_FAILED");
+                }
+                return ProxyTestResult {
+                    proxy_id: entry.id.clone(),
+                    success: false,
+                    protocol: proto_str,
+                    host_port,
+                    latency_ms: Some(tcp_latency),
+                    total_time_ms: Some(start_total.elapsed().as_millis() as u64),
+                    error_category: ProxyErrorCategory::HttpsConnectFailed,
+                    status_code: Some(code),
+                    test_type: "CONNECT".into(),
+                    tested_at,
+                    retry_count: 0,
+                    details: Some(format!("Unexpected CONNECT status: {code}")),
+                };
+            }
+        } else {
+            return ProxyTestResult {
+                proxy_id: entry.id.clone(),
+                success: false,
+                protocol: proto_str,
+                host_port,
+                latency_ms: Some(tcp_latency),
+                total_time_ms: Some(start_total.elapsed().as_millis() as u64),
+                error_category: ProxyErrorCategory::HttpsConnectFailed,
+                status_code: None,
+                test_type: "CONNECT".into(),
+                tested_at,
+                retry_count: 0,
+                details: Some("Unrecognized CONNECT response header".into()),
+            };
+        }
+
+        if debug {
+            eprintln!("{idx_label}authentication: OK");
+            eprintln!("{idx_label}CONNECT: OK");
+        }
+    }
+    drop(stream);
+
+    // 4. Functional Target Request via reqwest with strict no_proxy precedence
+    let scheme = match entry.kind {
+        ProxyKind::Socks5 => "socks5h",
+        ProxyKind::Http | ProxyKind::Geolocation => "http",
+        ProxyKind::Https => "https",
+    };
+    let proxy_url = if entry.username.is_empty() && entry.password.is_empty() {
+        format!("{scheme}://{}:{}", entry.host, entry.port)
+    } else {
+        let u = url::form_urlencoded::byte_serialize(entry.username.as_bytes()).collect::<String>();
+        let p = url::form_urlencoded::byte_serialize(entry.password.as_bytes()).collect::<String>();
+        format!("{scheme}://{u}:{p}@{}:{}", entry.host, entry.port)
+    };
+
+    let req_proxy = match reqwest::Proxy::all(&proxy_url) {
+        Ok(p) => p,
+        Err(e) => {
+            return ProxyTestResult {
+                proxy_id: entry.id.clone(),
+                success: false,
+                protocol: proto_str,
+                host_port,
+                latency_ms: Some(tcp_latency),
+                total_time_ms: Some(start_total.elapsed().as_millis() as u64),
+                error_category: ProxyErrorCategory::InvalidProxyUrl,
+                status_code: None,
+                test_type: "CLIENT_BUILD".into(),
+                tested_at,
+                retry_count: 0,
+                details: Some(format!("Failed to build reqwest proxy config: {e}")),
+            };
+        }
+    };
+
+    let client = match reqwest::Client::builder()
+        .no_proxy()
+        .proxy(req_proxy)
+        .timeout(Duration::from_millis(timeouts.target_response_ms))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return ProxyTestResult {
+                proxy_id: entry.id.clone(),
+                success: false,
+                protocol: proto_str,
+                host_port,
+                latency_ms: Some(tcp_latency),
+                total_time_ms: Some(start_total.elapsed().as_millis() as u64),
+                error_category: ProxyErrorCategory::HttpProxyRequestFailed,
+                status_code: None,
+                test_type: "CLIENT_BUILD".into(),
+                tested_at,
+                retry_count: 0,
+                details: Some(format!("Failed to build HTTP client: {e}")),
+            };
+        }
+    };
+
+    let target_test_type = if is_https { "HTTPS" } else { "HTTP" };
+    match client.get(target).send().await {
+        Ok(resp) => {
+            let code = resp.status().as_u16();
+            let total_ms = start_total.elapsed().as_millis() as u64;
+            if (200..400).contains(&code) {
+                if debug {
+                    eprintln!("{idx_label}{target_test_type} request: OK");
+                    eprintln!("{idx_label}latency: {total_ms}ms");
+                }
+                ProxyTestResult {
+                    proxy_id: entry.id.clone(),
+                    success: true,
+                    protocol: proto_str,
+                    host_port,
+                    latency_ms: Some(tcp_latency),
+                    total_time_ms: Some(total_ms),
+                    error_category: ProxyErrorCategory::Success,
+                    status_code: Some(code),
+                    test_type: target_test_type.into(),
+                    tested_at,
+                    retry_count: 0,
+                    details: Some("Request completed successfully".into()),
+                }
+            } else if code == 407 {
+                if debug {
+                    eprintln!("{idx_label}authentication: FAILED (HTTP 407)\n{idx_label}error: PROXY_AUTH_FAILED");
+                }
+                ProxyTestResult {
+                    proxy_id: entry.id.clone(),
+                    success: false,
+                    protocol: proto_str,
+                    host_port,
+                    latency_ms: Some(tcp_latency),
+                    total_time_ms: Some(total_ms),
+                    error_category: ProxyErrorCategory::ProxyAuthFailed,
+                    status_code: Some(code),
+                    test_type: target_test_type.into(),
+                    tested_at,
+                    retry_count: 0,
+                    details: Some("Proxy authentication required".into()),
+                }
+            } else if (400..500).contains(&code) {
+                if debug {
+                    eprintln!("{idx_label}target returned status {code}");
+                }
+                ProxyTestResult {
+                    proxy_id: entry.id.clone(),
+                    success: false,
+                    protocol: proto_str,
+                    host_port,
+                    latency_ms: Some(tcp_latency),
+                    total_time_ms: Some(total_ms),
+                    error_category: ProxyErrorCategory::ProxyReturned4xx,
+                    status_code: Some(code),
+                    test_type: target_test_type.into(),
+                    tested_at,
+                    retry_count: 0,
+                    details: Some(format!("Target or proxy returned HTTP {code}")),
+                }
+            } else {
+                if debug {
+                    eprintln!("{idx_label}target returned status {code}");
+                }
+                ProxyTestResult {
+                    proxy_id: entry.id.clone(),
+                    success: false,
+                    protocol: proto_str,
+                    host_port,
+                    latency_ms: Some(tcp_latency),
+                    total_time_ms: Some(total_ms),
+                    error_category: ProxyErrorCategory::ProxyReturned5xx,
+                    status_code: Some(code),
+                    test_type: target_test_type.into(),
+                    tested_at,
+                    retry_count: 0,
+                    details: Some(format!("Target or proxy returned HTTP {code}")),
+                }
+            }
+        }
+        Err(e) => {
+            let total_ms = start_total.elapsed().as_millis() as u64;
+            let err_str = e.to_string();
+            let cat = if e.is_timeout() {
+                ProxyErrorCategory::TargetTimeout
+            } else if e.is_connect() {
+                ProxyErrorCategory::TargetConnectionFailed
+            } else if err_str.to_lowercase().contains("tls")
+                || err_str.to_lowercase().contains("handshake")
+                || err_str.to_lowercase().contains("cert")
+            {
+                ProxyErrorCategory::TlsHandshakeFailed
+            } else {
+                ProxyErrorCategory::HttpProxyRequestFailed
+            };
+
+            if debug {
+                eprintln!(
+                    "{idx_label}{target_test_type} request: FAILED\n{idx_label}error: {}",
+                    cat.as_str()
+                );
+            }
+
+            ProxyTestResult {
+                proxy_id: entry.id.clone(),
+                success: false,
+                protocol: proto_str,
+                host_port,
+                latency_ms: Some(tcp_latency),
+                total_time_ms: Some(total_ms),
+                error_category: cat,
+                status_code: None,
+                test_type: target_test_type.into(),
+                tested_at,
+                retry_count: 0,
+                details: Some("Functional request through proxy failed".into()),
+            }
+        }
+    }
+}
+
+pub async fn diagnose_proxies_bulk(
+    entries: &[ProxyEntry],
+    target_url: &str,
+    timeouts: &ProxyTimeouts,
+    debug: bool,
+    concurrency: usize,
+) -> Vec<ProxyTestResult> {
+    use futures_util::stream::{self, StreamExt};
+    let conc = std::cmp::max(1, std::cmp::min(concurrency, 20));
+    let tasks: Vec<(usize, ProxyEntry)> = entries.iter().cloned().enumerate().collect();
+
+    stream::iter(tasks)
+        .map(|(idx, entry)| {
+            let timeouts_clone = timeouts.clone();
+            let target_str = target_url.to_string();
+            async move {
+                diagnose_proxy(&entry, &target_str, &timeouts_clone, debug, Some(idx + 1)).await
+            }
+        })
+        .buffer_unordered(conc)
+        .collect::<Vec<_>>()
+        .await
+}
+
+// ---- Bulk import & parser ----
+
+pub fn percent_decode(input: &str) -> String {
+    let mut bytes = Vec::with_capacity(input.len());
+    let mut chars = input.bytes();
+    while let Some(b) = chars.next() {
+        if b == b'%' {
+            let h1 = chars.next();
+            let h2 = chars.next();
+            if let (Some(c1), Some(c2)) = (h1, h2) {
+                let hex_str = [c1, c2];
+                if let Ok(s) = std::str::from_utf8(&hex_str) {
+                    if let Ok(val) = u8::from_str_radix(s, 16) {
+                        bytes.push(val);
+                        continue;
+                    }
+                }
+                bytes.push(b'%');
+                bytes.push(c1);
+                bytes.push(c2);
+                continue;
+            } else {
+                bytes.push(b'%');
+                if let Some(c1) = h1 {
+                    bytes.push(c1);
+                }
+                break;
+            }
+        }
+        bytes.push(b);
+    }
+    String::from_utf8_lossy(&bytes).to_string()
+}
 
 /// Parse a single proxy line for inline (unsaved) use by the API.
 pub fn parse_single(line: &str) -> Option<ProxyEntry> {
@@ -337,10 +1514,16 @@ pub fn parse_bulk(text: &str, default_kind: ProxyKind) -> Vec<ProxyEntry> {
 }
 
 fn parse_one(line: &str, default_kind: &ProxyKind) -> Option<ProxyEntry> {
-    // Optional trailing `# country=US note=foo`.
-    let (main, comment) = match line.find('#') {
-        Some(i) => (line[..i].trim(), Some(line[i + 1..].trim())),
-        None => (line, None),
+    let (main, comment) = {
+        let comment_pos = if let Some(at_idx) = line.find('@') {
+            line[at_idx..].find('#').map(|i| at_idx + i)
+        } else {
+            line.find('#')
+        };
+        match comment_pos {
+            Some(i) => (line[..i].trim(), Some(line[i + 1..].trim())),
+            None => (line.trim(), None),
+        }
     };
     let lower_main = main.to_lowercase();
     if lower_main.starts_with("geolocation://") {
@@ -362,45 +1545,95 @@ fn parse_one(line: &str, default_kind: &ProxyKind) -> Option<ProxyEntry> {
             kind: ProxyKind::Geolocation,
             host: host.trim().to_string(),
             port,
-            username: user.trim().to_string(),
-            password: pass.to_string(),
+            username: percent_decode(user.trim()),
+            password: percent_decode(pass),
             country: loc.clone(),
             notes: format!("Location: {loc}"),
+            source_format: Some("geolocation".to_string()),
             location_label: Some(loc),
             raw_input: Some(line.to_string()),
         });
     }
 
-    let (kind, rest) = if lower_main.starts_with("socks5://") {
-        (ProxyKind::Socks5, &main[9..])
-    } else if lower_main.starts_with("https://") {
-        (ProxyKind::Https, &main[8..])
-    } else if lower_main.starts_with("http://") {
-        (ProxyKind::Http, &main[7..])
-    } else {
-        (default_kind.clone(), main)
-    };
+    // Standard URI with scheme (http://, https://, socks5://)
+    if main.contains("://") {
+        if let Ok(parsed_url) = url::Url::parse(main) {
+            let scheme = parsed_url.scheme().to_lowercase();
+            let kind = match scheme.as_str() {
+                "socks5" | "socks5h" => ProxyKind::Socks5,
+                "https" => ProxyKind::Https,
+                "http" => ProxyKind::Http,
+                _ => default_kind.clone(),
+            };
+            let host = parsed_url.host_str()?.to_string();
+            let port = parsed_url.port().unwrap_or(match kind {
+                ProxyKind::Socks5 => 1080,
+                ProxyKind::Https => 443,
+                _ => 8080,
+            });
+            let user = percent_decode(parsed_url.username());
+            let pass = parsed_url.password().map(percent_decode).unwrap_or_default();
 
-    let (host_part, user, pass) = if let Some((u, hp)) = rest.split_once('@') {
-        let (un, pw) = u.split_once(':').unwrap_or((u, ""));
-        (hp.to_string(), un.to_string(), pw.to_string())
+            let mut country = String::new();
+            let mut notes = String::new();
+            let mut name_parts: Vec<&str> = Vec::new();
+            if let Some(c) = comment {
+                for kv in c.split_whitespace() {
+                    if let Some(v) = kv.strip_prefix("country=") {
+                        country = v.to_string();
+                    } else if let Some(v) = kv.strip_prefix("note=") {
+                        notes = v.to_string();
+                    } else {
+                        name_parts.push(kv.trim_start_matches('#'));
+                    }
+                }
+            }
+            let name = name_parts.join(" ");
+            let src_fmt = match scheme.as_str() {
+                "socks5" | "socks5h" => "socks5",
+                "https" => "https",
+                "http" => "http",
+                _ => "custom",
+            };
+            return Some(ProxyEntry {
+                id: uuid::Uuid::new_v4().to_string(),
+                name: if name.is_empty() { format!("{host}:{port}") } else { name },
+                kind,
+                host,
+                port,
+                username: user,
+                password: pass,
+                country,
+                notes,
+                source_format: Some(src_fmt.to_string()),
+                location_label: None,
+                raw_input: Some(line.to_string()),
+            });
+        }
+    }
+
+    let kind = default_kind.clone();
+    let (host_part, user, pass) = if let Some(at_idx) = main.rfind('@') {
+        let auth_part = &main[..at_idx];
+        let hp = &main[at_idx + 1..];
+        let (un, pw) = auth_part.split_once(':').unwrap_or((auth_part, ""));
+        (hp.to_string(), percent_decode(un), percent_decode(pw))
     } else {
-        // host:port or host:port:user:pass or user:pass:host:port
-        let parts: Vec<&str> = rest.split(':').collect();
+        let parts: Vec<&str> = main.split(':').collect();
         match parts.len() {
-            2 => (rest.to_string(), String::new(), String::new()),
+            2 => (main.to_string(), String::new(), String::new()),
             4 => {
                 if parts[1].parse::<u16>().is_ok() {
                     (
                         format!("{}:{}", parts[0], parts[1]),
-                        parts[2].to_string(),
-                        parts[3].to_string(),
+                        percent_decode(parts[2]),
+                        percent_decode(parts[3]),
                     )
                 } else if parts[3].parse::<u16>().is_ok() {
                     (
                         format!("{}:{}", parts[2], parts[3]),
-                        parts[0].to_string(),
-                        parts[1].to_string(),
+                        percent_decode(parts[0]),
+                        percent_decode(parts[1]),
                     )
                 } else {
                     return None;
@@ -414,7 +1647,6 @@ fn parse_one(line: &str, default_kind: &ProxyKind) -> Option<ProxyEntry> {
     let port: u16 = port_s.parse().ok()?;
     let mut country = String::new();
     let mut notes = String::new();
-    // The comment is the name; `key=value` is only for lines older builds wrote.
     let mut name_parts: Vec<&str> = Vec::new();
     if let Some(c) = comment {
         for kv in c.split_whitespace() {
@@ -428,8 +1660,13 @@ fn parse_one(line: &str, default_kind: &ProxyKind) -> Option<ProxyEntry> {
         }
     }
     let name = name_parts.join(" ");
+    let src_fmt = match default_kind {
+        ProxyKind::Socks5 => "socks5",
+        ProxyKind::Geolocation => "geolocation",
+        ProxyKind::Https => "https",
+        ProxyKind::Http => "http",
+    };
     Some(ProxyEntry {
-        // ID assigned now so pre-save test snapshots key under the kept uuid.
         id: uuid::Uuid::new_v4().to_string(),
         name: if name.is_empty() { format!("{host}:{port}") } else { name },
         kind,
@@ -439,6 +1676,7 @@ fn parse_one(line: &str, default_kind: &ProxyKind) -> Option<ProxyEntry> {
         password: pass,
         country,
         notes,
+        source_format: Some(src_fmt.to_string()),
         location_label: None,
         raw_input: Some(line.to_string()),
     })
@@ -468,7 +1706,6 @@ pub fn bulk_save(entries: Vec<ProxyEntry>) -> Result<usize> {
 
 // ---- UDP probe (SOCKS5 UDP_ASSOCIATE; RFC 1928 §7) ----
 
-/// Resolve a public STUN server to IPv4 (probe target for the UDP relay).
 async fn resolve_stun_ipv4() -> Result<(std::net::Ipv4Addr, u16)> {
     const HOSTS: &[&str] = &[
         "stun.l.google.com:19302",
@@ -488,9 +1725,7 @@ async fn resolve_stun_ipv4() -> Result<(std::net::Ipv4Addr, u16)> {
 }
 
 pub async fn probe_udp(entry: &ProxyEntry) -> Result<u128> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::{TcpStream, UdpSocket};
-    use tokio::time::{timeout, Duration, Instant};
+    use tokio::net::UdpSocket;
 
     if !matches!(entry.kind, ProxyKind::Socks5) {
         anyhow::bail!("UDP probe only supported for SOCKS5");
@@ -523,9 +1758,7 @@ pub async fn probe_udp(entry: &ProxyEntry) -> Result<u128> {
             anyhow::bail!("auth failed");
         }
     }
-    // UDP_ASSOCIATE: cmd=0x03, ATYP=IPv4, addr=0.0.0.0, port=0
-    tcp.write_all(&[0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
-        .await?;
+    tcp.write_all(&[0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
     let mut hdr = [0u8; 4];
     tcp.read_exact(&mut hdr).await?;
     if hdr[1] != 0x00 {
@@ -533,14 +1766,12 @@ pub async fn probe_udp(entry: &ProxyEntry) -> Result<u128> {
     }
     let bind_addr: SocketAddr = match hdr[3] {
         0x01 => {
-            // IPv4
             let mut ip = [0u8; 4];
             tcp.read_exact(&mut ip).await?;
             let mut p = [0u8; 2];
             tcp.read_exact(&mut p).await?;
             let port = u16::from_be_bytes(p);
             let v4 = std::net::Ipv4Addr::from(ip);
-            // 0.0.0.0 → fall back to TCP peer (where the relay lives).
             if v4.is_unspecified() {
                 let peer = tcp.peer_addr()?;
                 SocketAddr::new(peer.ip(), port)
@@ -558,7 +1789,6 @@ pub async fn probe_udp(entry: &ProxyEntry) -> Result<u128> {
         _ => anyhow::bail!("unsupported ATYP in UDP reply"),
     };
 
-    // Probe with STUN binding request (DNS-port-53 often blocked, STUN passes).
     let (stun_ip, stun_port) = resolve_stun_ipv4()
         .await
         .context("could not resolve a STUN server to probe UDP with")?;
@@ -566,11 +1796,9 @@ pub async fn probe_udp(entry: &ProxyEntry) -> Result<u128> {
     let udp = UdpSocket::bind("0.0.0.0:0").await?;
     udp.connect(bind_addr).await?;
     let mut pkt: Vec<u8> = Vec::with_capacity(32);
-    // SOCKS5 UDP header: RSV(2)=0, FRAG=0, ATYP=IPv4, DST=<stun>, PORT.
     pkt.extend_from_slice(&[0, 0, 0, 0x01]);
     pkt.extend_from_slice(&stun_ip.octets());
     pkt.extend_from_slice(&stun_port.to_be_bytes());
-    // STUN Binding Request (RFC 5389): type=0x0001, magic 0x2112A442, 12B txid.
     let mut stun = vec![0x00u8, 0x01, 0x00, 0x00, 0x21, 0x12, 0xA4, 0x42];
     stun.extend_from_slice(&uuid::Uuid::new_v4().as_bytes()[..12]);
     pkt.extend_from_slice(&stun);
@@ -583,7 +1811,6 @@ pub async fn probe_udp(entry: &ProxyEntry) -> Result<u128> {
     if n < 20 {
         anyhow::bail!("UDP reply too short");
     }
-    // RFC 1928: dropping TCP control tears down the relay; keep it alive.
     drop(tcp);
     Ok(started.elapsed().as_millis())
 }
@@ -594,7 +1821,6 @@ pub async fn probe_udp(entry: &ProxyEntry) -> Result<u128> {
 pub struct GeoInfo {
     pub ip: String,
     pub country: String,
-    /// ISO 3166-1 alpha-2.
     pub country_code: String,
     pub region: String,
     pub city: String,
@@ -605,12 +1831,10 @@ pub struct GeoInfo {
     pub provider: String,
 }
 
-/// Probe IP/country the world sees when traffic exits the proxy.
 pub async fn geo_check(entry: &ProxyEntry, provider_override: Option<String>) -> Result<GeoInfo> {
     geo_check_via(Some(entry), provider_override).await
 }
 
-/// Probe geo through `entry` if Some, else direct; provider default ip-api.com.
 pub async fn geo_check_via(entry: Option<&ProxyEntry>, provider_override: Option<String>) -> Result<GeoInfo> {
     let provider = provider_override
         .filter(|s| !s.is_empty())
@@ -624,10 +1848,10 @@ pub async fn geo_check_via(entry: Option<&ProxyEntry>, provider_override: Option
     };
 
     let mut builder = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(8));
+        .timeout(std::time::Duration::from_secs(10));
     if let Some(entry) = entry {
         let scheme = match entry.kind {
-            ProxyKind::Socks5 => "socks5h", // DNS via proxy
+            ProxyKind::Socks5 => "socks5h",
             ProxyKind::Http | ProxyKind::Geolocation => "http",
             ProxyKind::Https => "https",
         };
@@ -639,9 +1863,8 @@ pub async fn geo_check_via(entry: Option<&ProxyEntry>, provider_override: Option
             format!("{scheme}://{user}:{pass}@{}:{}", entry.host, entry.port)
         };
         let proxy = reqwest::Proxy::all(&proxy_url).context("bad proxy URL")?;
-        builder = builder.proxy(proxy);
+        builder = builder.no_proxy().proxy(proxy);
     } else {
-        // Direct check: bypass any system proxy.
         builder = builder.no_proxy();
     }
     let client = builder.build()?;
@@ -712,7 +1935,6 @@ pub async fn geo_check_via(entry: Option<&ProxyEntry>, provider_override: Option
     Ok(info)
 }
 
-/// Map ISO-3166 alpha-2 to BCP-47 locale (coarse).
 pub fn country_to_locale(cc: &str) -> &'static str {
     match cc.to_ascii_uppercase().as_str() {
         "US" => "en-US",
@@ -773,7 +1995,6 @@ pub fn country_to_locale(cc: &str) -> &'static str {
 
 // ---- Test history ----
 
-/// One observation of a proxy's exit state; same-IP consecutive entries collapse.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TestSnapshot {
     pub first_seen: String,
@@ -818,7 +2039,6 @@ fn save_history(s: &HistoryStore) -> Result<()> {
     Ok(())
 }
 
-/// Persist a test result; same-IP entries collapse, capped at 50 per proxy.
 fn record_test(proxy_id: &str, mut snap: TestSnapshot) -> Result<TestSnapshot> {
     if proxy_id.is_empty() {
         if snap.first_seen.is_empty() {
@@ -871,7 +2091,6 @@ fn unix_now() -> String {
     format!("@{s}")
 }
 
-/// Run TCP + UDP + geo, persist into history, auto-fill country tag.
 pub async fn full_test(entry: &ProxyEntry) -> Result<TestSnapshot> {
     let now = unix_now();
 
@@ -883,7 +2102,6 @@ pub async fn full_test(entry: &ProxyEntry) -> Result<TestSnapshot> {
     };
     let geo_res = geo_check(entry, None).await;
 
-    // TCP failure → zero geo so snapshot reads "Failed, no IP".
     let tcp_failed = tcp_res.is_err();
     let (ip, country_code, country, region, city, isp, tz, lat, lng, provider) =
         match (&geo_res, tcp_failed) {
@@ -921,7 +2139,6 @@ pub async fn full_test(entry: &ProxyEntry) -> Result<TestSnapshot> {
 
     let recorded = record_test(&entry.id, snap)?;
 
-    // Backfill empty country tag on the stored entry.
     if !recorded.country_code.is_empty() {
         let mut store_data = load()?;
         if let Some(p) = store_data.proxies.iter_mut().find(|p| p.id == entry.id) {
@@ -935,7 +2152,6 @@ pub async fn full_test(entry: &ProxyEntry) -> Result<TestSnapshot> {
     Ok(recorded)
 }
 
-/// Fallback country → IANA timezone for providers that omit timezone.
 pub fn country_to_timezone(cc: &str) -> &'static str {
     match cc.to_ascii_uppercase().as_str() {
         "US" => "America/New_York",
@@ -981,5 +2197,416 @@ pub fn country_to_timezone(cc: &str) -> &'static str {
         "SA" => "Asia/Riyadh",
         "AE" => "Asia/Dubai",
         _ => "UTC",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::TcpListener;
+
+    // 1. URL-encoded credentials parsing test
+    #[test]
+    fn test_url_encoded_credentials_parsing() {
+        let raw = "http://user%40domain.com:p%40ss%3Aword%21@127.0.0.1:8080";
+        let parsed = parse_single(raw).expect("Must parse valid encoded proxy URL");
+        assert_eq!(parsed.kind, ProxyKind::Http);
+        assert_eq!(parsed.host, "127.0.0.1");
+        assert_eq!(parsed.port, 8080);
+        assert_eq!(parsed.username, "user@domain.com");
+        assert_eq!(parsed.password, "p@ss:word!");
+    }
+
+    // 2. Malformed proxy URL test
+    #[test]
+    fn test_malformed_proxy_url() {
+        let entry = ProxyEntry {
+            id: "test-bad".into(),
+            name: "Bad".into(),
+            kind: ProxyKind::Http,
+            host: "".into(),
+            port: 0,
+            username: "".into(),
+            password: "".into(),
+            country: "".into(),
+            notes: "".into(),
+            source_format: None,
+            location_label: None,
+            raw_input: None,
+        };
+        let timeouts = ProxyTimeouts::default();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let res = rt.block_on(diagnose_proxy(&entry, "https://example.com/", &timeouts, false, None));
+        assert_eq!(res.error_category, ProxyErrorCategory::InvalidProxyUrl);
+        assert!(!res.success);
+    }
+
+    // 3. Invalid hostname -> DNS_FAILURE test
+    #[tokio::test]
+    async fn test_invalid_hostname_dns_failure() {
+        let entry = ProxyEntry {
+            id: "test-dns".into(),
+            name: "Bad Host".into(),
+            kind: ProxyKind::Http,
+            host: "invalid-domain-xyz-nonexistent-987.local".into(),
+            port: 1080,
+            username: "user".into(),
+            password: "pass".into(),
+            country: "".into(),
+            notes: "".into(),
+            source_format: None,
+            location_label: None,
+            raw_input: None,
+        };
+        let timeouts = ProxyTimeouts::default();
+        let res = diagnose_proxy(&entry, "https://example.com/", &timeouts, false, None).await;
+        assert_eq!(res.error_category, ProxyErrorCategory::DnsFailure);
+        assert!(!res.success);
+    }
+
+    // 4. Closed port -> TCP_CONNECTION_FAILED test
+    #[tokio::test]
+    async fn test_closed_port_tcp_failure() {
+        // Port 59998 is closed
+        let entry = ProxyEntry {
+            id: "test-closed".into(),
+            name: "Closed Port".into(),
+            kind: ProxyKind::Http,
+            host: "127.0.0.1".into(),
+            port: 59998,
+            username: "user".into(),
+            password: "pass".into(),
+            country: "".into(),
+            notes: "".into(),
+            source_format: None,
+            location_label: None,
+            raw_input: None,
+        };
+        let timeouts = ProxyTimeouts {
+            tcp_connect_ms: 3000,
+            ..Default::default()
+        };
+        let res = diagnose_proxy(&entry, "https://example.com/", &timeouts, false, None).await;
+        assert!(matches!(
+            res.error_category,
+            ProxyErrorCategory::TcpConnectionFailed | ProxyErrorCategory::ConnectionTimeout
+        ));
+        assert!(!res.success);
+    }
+
+    // 5. HTTP 407 Proxy Authentication Required test
+    #[tokio::test]
+    async fn test_mock_proxy_auth_failure_407() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                let resp = "HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"mock\"\r\nContent-Length: 0\r\n\r\n";
+                let _ = socket.write_all(resp.as_bytes()).await;
+            }
+        });
+
+        let entry = ProxyEntry {
+            id: "mock-407".into(),
+            name: "Mock 407".into(),
+            kind: ProxyKind::Http,
+            host: "127.0.0.1".into(),
+            port,
+            username: "baduser".into(),
+            password: "badpassword".into(),
+            country: "".into(),
+            notes: "".into(),
+            source_format: None,
+            location_label: None,
+            raw_input: None,
+        };
+
+        let timeouts = ProxyTimeouts::default();
+        let res = diagnose_proxy(&entry, "https://example.com/", &timeouts, false, None).await;
+        assert_eq!(res.error_category, ProxyErrorCategory::ProxyAuthFailed);
+        assert_eq!(res.status_code, Some(407));
+        assert!(!res.success);
+    }
+
+    // 6. Connection Timeout test
+    #[tokio::test]
+    async fn test_mock_connection_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        // Accept connection but do not read or respond (hanging)
+        tokio::spawn(async move {
+            if let Ok((_socket, _)) = listener.accept().await {
+                tokio::time::sleep(Duration::from_millis(5000)).await;
+            }
+        });
+
+        let entry = ProxyEntry {
+            id: "mock-timeout".into(),
+            name: "Mock Timeout".into(),
+            kind: ProxyKind::Http,
+            host: "127.0.0.1".into(),
+            port,
+            username: "user".into(),
+            password: "pass".into(),
+            country: "".into(),
+            notes: "".into(),
+            source_format: None,
+            location_label: None,
+            raw_input: None,
+        };
+
+        let timeouts = ProxyTimeouts {
+            tcp_connect_ms: 2000,
+            auth_handshake_ms: 500,
+            connect_tunnel_ms: 500,
+            tls_handshake_ms: 500,
+            target_response_ms: 500,
+        };
+        let res = diagnose_proxy(&entry, "https://example.com/", &timeouts, false, None).await;
+        assert_eq!(res.error_category, ProxyErrorCategory::ConnectionTimeout);
+        assert!(!res.success);
+    }
+
+    // 7. Proxy Pool Rotation & Health Transition test
+    #[test]
+    fn test_proxy_pool_lifecycle_and_rotation() {
+        let p1 = ProxyEntry {
+            id: "p1".into(), name: "P1".into(), kind: ProxyKind::Http, host: "1.1.1.1".into(), port: 80,
+            username: "".into(), password: "".into(), country: "".into(), notes: "".into(), source_format: None, location_label: None, raw_input: None,
+        };
+        let p2 = ProxyEntry {
+            id: "p2".into(), name: "P2".into(), kind: ProxyKind::Http, host: "2.2.2.2".into(), port: 80,
+            username: "".into(), password: "".into(), country: "".into(), notes: "".into(), source_format: None, location_label: None, raw_input: None,
+        };
+
+        let mut pool = ProxyPool::new(vec![p1.clone(), p2.clone()]);
+        let now = 1000u64;
+
+        // Round robin
+        let next1 = pool.get_next_healthy(now).unwrap();
+        assert_eq!(next1.id, "p1");
+        let next2 = pool.get_next_healthy(now).unwrap();
+        assert_eq!(next2.id, "p2");
+
+        // Report failure on p1 -> enters Cooldown
+        let failure_res = ProxyTestResult {
+            proxy_id: "p1".into(),
+            success: false,
+            protocol: "http".into(),
+            host_port: "1.1.1.1:80".into(),
+            latency_ms: None,
+            total_time_ms: None,
+            error_category: ProxyErrorCategory::TcpConnectionFailed,
+            status_code: None,
+            test_type: "TCP".into(),
+            tested_at: "@1000".into(),
+            retry_count: 1,
+            details: None,
+        };
+        pool.record_result("p1", &failure_res, now);
+
+        // p1 is in cooldown; only p2 is available
+        let next3 = pool.get_next_healthy(now).unwrap();
+        assert_eq!(next3.id, "p2");
+
+        // Advance time past cooldown (5s)
+        let next4 = pool.get_next_healthy(now + 10).unwrap();
+        assert_eq!(next4.id, "p1");
+
+        // Target site error should NOT mark proxy dead
+        let target_err = ProxyTestResult {
+            proxy_id: "p1".into(),
+            success: false,
+            protocol: "http".into(),
+            host_port: "1.1.1.1:80".into(),
+            latency_ms: None,
+            total_time_ms: None,
+            error_category: ProxyErrorCategory::TargetTimeout,
+            status_code: None,
+            test_type: "HTTPS".into(),
+            tested_at: "@1015".into(),
+            retry_count: 1,
+            details: None,
+        };
+        pool.record_result("p1", &target_err, now + 15);
+        assert_eq!(pool.health_map["p1"].state, ProxyHealthState::TemporarilyFailed);
+
+        // Reset pool
+        pool.reset_pool();
+        assert_eq!(pool.health_map["p1"].state, ProxyHealthState::Healthy);
+    }
+
+    // 8. Safe debug mode secret protection test
+    #[test]
+    fn test_secret_redaction_in_config_and_results() {
+        let config = ProxyConfig {
+            protocol: "http".into(),
+            host: "geo.floppydata.com".into(),
+            port: 10080,
+            username: Some("SuperSecretUser123".into()),
+            password: Some("UltraConfidentialPass456".into()),
+            source_format: Some("geolocation".into()),
+            location_label: Some("United States - 54".into()),
+            raw_input: None,
+        };
+
+        let sanitized = config.to_sanitized_string();
+        assert!(!sanitized.contains("SuperSecretUser123"));
+        assert!(!sanitized.contains("UltraConfidentialPass456"));
+        assert!(sanitized.contains("****:****"));
+
+        let result = ProxyTestResult {
+            proxy_id: "test".into(),
+            success: true,
+            protocol: "http".into(),
+            host_port: config.host_port(),
+            latency_ms: Some(150),
+            total_time_ms: Some(300),
+            error_category: ProxyErrorCategory::Success,
+            status_code: Some(200),
+            test_type: "HTTPS".into(),
+            tested_at: "@1000".into(),
+            retry_count: 0,
+            details: Some("Connected OK".into()),
+        };
+        let serialized = serde_json::to_string(&result).unwrap();
+        assert!(!serialized.contains("SuperSecretUser123"));
+        assert!(!serialized.contains("UltraConfidentialPass456"));
+    }
+
+    // 9. Profile-scoped runtime proxy auth extension tests
+    #[test]
+    fn test_create_proxy_auth_extension_manifest_and_script() {
+        let temp_dir = std::env::temp_dir().join(format!("test_udd_{}", uuid::Uuid::new_v4()));
+        let _ = fs::create_dir_all(&temp_dir);
+
+        let entry = ProxyEntry {
+            id: "p-test".into(),
+            name: "Test Auth Proxy".into(),
+            kind: ProxyKind::Http,
+            host: "geo.floppydata.com".into(),
+            port: 10080,
+            username: "test_user_\"special\"\\chars".into(),
+            password: "test_pass_'secure'$123".into(),
+            country: "US".into(),
+            source_format: None,
+            location_label: None,
+            raw_input: None,
+            notes: "Test notes".into(),
+        };
+
+        let ext_dir = create_proxy_auth_extension(&temp_dir, &entry).expect("create extension");
+        assert!(ext_dir.exists());
+
+        // Verify manifest.json
+        let manifest_path = ext_dir.join("manifest.json");
+        assert!(manifest_path.exists());
+        let manifest_content = fs::read_to_string(&manifest_path).expect("read manifest");
+        let manifest_json: serde_json::Value = serde_json::from_str(&manifest_content).expect("parse manifest");
+        assert_eq!(manifest_json["manifest_version"], 3);
+        assert_eq!(manifest_json["background"]["service_worker"], "background.js");
+        let perms = manifest_json["permissions"].as_array().expect("permissions array");
+        assert!(perms.iter().any(|p| p.as_str() == Some("webRequest")));
+        assert!(perms.iter().any(|p| p.as_str() == Some("webRequestAuthProvider")));
+
+        // Verify background.js
+        let bg_path = ext_dir.join("background.js");
+        assert!(bg_path.exists());
+        let bg_content = fs::read_to_string(&bg_path).expect("read background.js");
+        assert!(bg_content.contains("chrome.webRequest.onAuthRequired.addListener"));
+        // Safely escaped in JS
+        assert!(bg_content.contains("test_user_\\\"special\\\"\\\\chars"));
+        assert!(bg_content.contains("test_pass_'secure'$123"));
+        assert!(bg_content.contains("geo.floppydata.com"));
+
+        // Clean up
+        remove_proxy_auth_extension(&temp_dir).expect("remove extension");
+        assert!(!ext_dir.exists());
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_credential_isolation_between_profiles() {
+        let temp_dir_a = std::env::temp_dir().join(format!("test_udd_a_{}", uuid::Uuid::new_v4()));
+        let temp_dir_b = std::env::temp_dir().join(format!("test_udd_b_{}", uuid::Uuid::new_v4()));
+        let _ = fs::create_dir_all(&temp_dir_a);
+        let _ = fs::create_dir_all(&temp_dir_b);
+
+        let entry_a = ProxyEntry {
+            id: "p-a".into(),
+            name: "Proxy A".into(),
+            kind: ProxyKind::Http,
+            host: "proxy-a.example.com".into(),
+            port: 8080,
+            username: "user_a".into(),
+            password: "secret_password_a".into(),
+            country: "US".into(),
+            source_format: None,
+            location_label: None,
+            raw_input: None,
+            notes: "".into(),
+        };
+
+        let entry_b = ProxyEntry {
+            id: "p-b".into(),
+            name: "Proxy B".into(),
+            kind: ProxyKind::Http,
+            host: "proxy-b.example.com".into(),
+            port: 9090,
+            username: "user_b".into(),
+            password: "secret_password_b".into(),
+            country: "DE".into(),
+            source_format: None,
+            location_label: None,
+            raw_input: None,
+            notes: "".into(),
+        };
+
+        let ext_a = create_proxy_auth_extension(&temp_dir_a, &entry_a).expect("create ext a");
+        let ext_b = create_proxy_auth_extension(&temp_dir_b, &entry_b).expect("create ext b");
+
+        let bg_a = fs::read_to_string(ext_a.join("background.js")).unwrap();
+        let bg_b = fs::read_to_string(ext_b.join("background.js")).unwrap();
+
+        // Strict isolation: Profile A has only user_a, never user_b
+        assert!(bg_a.contains("user_a"));
+        assert!(bg_a.contains("secret_password_a"));
+        assert!(!bg_a.contains("user_b"));
+        assert!(!bg_a.contains("secret_password_b"));
+
+        // Profile B has only user_b, never user_a
+        assert!(bg_b.contains("user_b"));
+        assert!(bg_b.contains("secret_password_b"));
+        assert!(!bg_b.contains("user_a"));
+        assert!(!bg_b.contains("secret_password_a"));
+
+        let _ = fs::remove_dir_all(&temp_dir_a);
+        let _ = fs::remove_dir_all(&temp_dir_b);
+    }
+
+    #[test]
+    fn test_geolocation_proxy_with_hash_in_password_and_source_format() {
+        let raw = "geolocation://testuser:p#ssw0rd!@geo.floppydata.com:10080:United States - 54";
+        let parsed = parse_one(raw, &ProxyKind::Http).expect("should parse geolocation with # in password");
+        assert_eq!(parsed.kind, ProxyKind::Geolocation);
+        assert_eq!(parsed.username, "testuser");
+        assert_eq!(parsed.password, "p#ssw0rd!");
+        assert_eq!(parsed.host, "geo.floppydata.com");
+        assert_eq!(parsed.port, 10080);
+        assert_eq!(parsed.location_label.as_deref(), Some("United States - 54"));
+        assert_eq!(parsed.source_format.as_deref(), Some("geolocation"));
+
+        let cfg = parsed.to_config();
+        assert_eq!(cfg.protocol, "http");
+        assert_eq!(cfg.source_format.as_deref(), Some("geolocation"));
+        assert_eq!(cfg.location_label.as_deref(), Some("United States - 54"));
+
+        let restored_entry = cfg.to_entry();
+        assert_eq!(restored_entry.kind, ProxyKind::Geolocation);
+        assert_eq!(restored_entry.source_format.as_deref(), Some("geolocation"));
     }
 }

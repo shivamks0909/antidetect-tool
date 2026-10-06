@@ -15,7 +15,7 @@ const MANIFEST_URL: &str =
     "https://raw.githubusercontent.com/ProxyShard/ShardBrowser/main/runtime.json";
 const LAUNCHER_RELEASE_REPO: &str = "OpinionInsights/Browser";
 /// Chromium version baked into the current bundle (used for Mac Framework path).
-pub const CHROMIUM_VERSION: &str = "152.0.7977.65";
+pub const CHROMIUM_VERSION: &str = "140.0.7339.210";
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ArchiveSpec {
@@ -80,18 +80,68 @@ pub fn runtime_dir() -> Result<PathBuf> {
 pub fn binary_path() -> Result<PathBuf> {
     let base = runtime_dir()?;
     #[cfg(target_os = "macos")]
-    return Ok(base
-        .join("Opinion-Insights-Engine")
-        .join("Opinion Insights Browser.app")
-        .join("Contents")
-        .join("MacOS")
-        .join("chrome"));
+    {
+        for cand in &[
+            base.join("ShardX-Mac-arm64").join("ShardX.app").join("Contents").join("MacOS").join("ShardX"),
+            base.join("Opinion-Insights-Engine").join("Opinion Insights Browser.app").join("Contents").join("MacOS").join("chrome"),
+            base.join("ShardX-Mac-arm64").join("Opinion Insights Browser.app").join("Contents").join("MacOS").join("chrome"),
+        ] {
+            if cand.exists() {
+                return Ok(cand.clone());
+            }
+        }
+        return Ok(base.join("ShardX-Mac-arm64").join("ShardX.app").join("Contents").join("MacOS").join("ShardX"));
+    }
     #[cfg(target_os = "windows")]
     {
-        return Ok(base.join("Opinion-Insights-Engine").join("chrome.exe"));
+        for cand in &[
+            base.join("ShardX-Windows").join("chrome.exe"),
+            base.join("Opinion-Insights-Engine").join("chrome.exe"),
+        ] {
+            if cand.exists() {
+                return Ok(cand.clone());
+            }
+        }
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                for cand in &[
+                    dir.join("resources").join("Opinion-Insights-Engine").join("chrome.exe"),
+                    dir.join("resources").join("ShardX-Windows").join("chrome.exe"),
+                    dir.join("_up_").join("resources").join("Opinion-Insights-Engine").join("chrome.exe"),
+                    dir.join("_up_").join("resources").join("ShardX-Windows").join("chrome.exe"),
+                    dir.join("Opinion-Insights-Engine").join("chrome.exe"),
+                    dir.join("ShardX-Windows").join("chrome.exe"),
+                ] {
+                    if cand.exists() {
+                        return Ok(cand.clone());
+                    }
+                }
+            }
+        }
+        for cand in &[
+            PathBuf::from("src-tauri").join("resources").join("Opinion-Insights-Engine").join("chrome.exe"),
+            PathBuf::from("src-tauri").join("resources").join("ShardX-Windows").join("chrome.exe"),
+            PathBuf::from("resources").join("Opinion-Insights-Engine").join("chrome.exe"),
+            PathBuf::from("resources").join("ShardX-Windows").join("chrome.exe"),
+        ] {
+            if cand.exists() {
+                return Ok(cand.clone());
+            }
+        }
+        return Ok(base.join("ShardX-Windows").join("chrome.exe"));
     }
     #[cfg(target_os = "linux")]
-    return Ok(base.join("Opinion-Insights-Engine").join("chrome"));
+    {
+        for cand in &[
+            base.join("ShardX-Linux").join("chrome"),
+            base.join("Opinion-Insights-Engine").join("chrome"),
+        ] {
+            if cand.exists() {
+                return Ok(cand.clone());
+            }
+        }
+        return Ok(base.join("ShardX-Linux").join("chrome"));
+    }
 }
 
 fn manifest_path() -> Result<PathBuf> {
@@ -104,11 +154,11 @@ fn engine_root_dir() -> &'static str {
     #[cfg(target_os = "macos")]
     return "ShardX-Mac-arm64";
     #[cfg(target_os = "windows")]
-    return "Opinion-Insights-Engine";
+    return "ShardX-Windows";
     #[cfg(target_os = "linux")]
     return "ShardX-Linux";
     #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
-    return "Opinion-Insights-Engine";
+    return "ShardX-Windows";
 }
 
 // Bundled fingerprint library (cross-platform); seeds fingerprints dir on first run.
@@ -169,18 +219,19 @@ fn installed_engine_version() -> Option<String> {
     }
     #[cfg(target_os = "windows")]
     {
-        let dir = base.join("Opinion-Insights-Engine");
-        // Marker is the `<version>.manifest` sidecar next to chrome.exe. Require
-        // the stem to parse as a dotted version so a stray/leftover file can't
-        // feed a bogus version into the update check.
         let looks_like_version =
             |s: &str| s.split('.').count() >= 2 && s.starts_with(|c: char| c.is_ascii_digit());
-        for ent in fs::read_dir(&dir).ok()?.flatten() {
-            let p = ent.path();
-            if p.extension().and_then(|s| s.to_str()) == Some("manifest") {
-                if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
-                    if looks_like_version(stem) {
-                        return Some(stem.to_string());
+        for dir_name in &["ShardX-Windows", "Opinion-Insights-Engine"] {
+            let dir = base.join(dir_name);
+            if let Ok(entries) = fs::read_dir(&dir) {
+                for ent in entries.flatten() {
+                    let p = ent.path();
+                    if p.extension().and_then(|s| s.to_str()) == Some("manifest") {
+                        if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+                            if looks_like_version(stem) {
+                                return Some(stem.to_string());
+                            }
+                        }
                     }
                 }
             }
@@ -283,7 +334,11 @@ struct RemoteManifest {
 /// R2/S3 per-archive. Empty/None when unreachable.
 async fn fetch_manifest() -> RemoteManifest {
     async fn inner() -> Option<RemoteManifest> {
-        let resp = reqwest::Client::new().get(MANIFEST_URL).send().await.ok()?;
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(1500))
+            .build()
+            .ok()?;
+        let resp = client.get(MANIFEST_URL).send().await.ok()?;
         if !resp.status().is_success() {
             return None;
         }
@@ -537,13 +592,21 @@ pub fn seed_bundled_fingerprints() {
     }
 }
 
+
 pub fn ensure_bundled_runtime() {
+    // Handle archive rename: ShardX-Windows ↔ Opinion-Insights-Engine.
+    // Runs before everything else so binary_path() always resolves.
+    migrate_engine_dir();
+
     let engine_dir = engine_root_dir();
     let copied = copy_bundled_dir_if_present(engine_dir);
     seed_bundled_fingerprints();
 
     let binary_exists = binary_path().map(|p| p.exists()).unwrap_or(false);
     if copied || binary_exists {
+        // Patch chrome.exe PE resources so Windows shell shows correct branding.
+        patch_chrome_identity();
+
         let mut m = load_manifest();
         let mut modified = false;
         if m.installed_chromium_version.is_none() {
@@ -567,6 +630,216 @@ pub fn ensure_bundled_runtime() {
         }
     }
 }
+
+/// Patch chrome.exe PE version-info resources so Windows shell (Alt+Tab,
+/// taskbar, Task Manager) shows "Opinion Insights Browser" instead of the
+/// upstream "ShardX" branding baked into the CDN archive.
+///
+/// Uses rcedit-x64.exe, searched next to the launcher exe first, then at
+/// several known system locations (Antigravity IDE ships it). Silently skipped
+/// when rcedit is not found — the app still functions, only the branding is
+/// wrong until the user installs rcedit or we ship a future pure-Rust patcher.
+#[cfg(target_os = "windows")]
+pub fn patch_chrome_identity() {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+    let Ok(base) = runtime_dir() else { return };
+    let icon_path = find_launcher_icon();
+
+    for dir_name in &["ShardX-Windows", "Opinion-Insights-Engine"] {
+        let dir_path = base.join(dir_name);
+        let chrome = dir_path.join("chrome.exe");
+        if !chrome.exists() {
+            continue;
+        }
+
+        // Fast path: if already marked as patched, skip all subprocess checks completely
+        let tag_file = dir_path.join(".opinion_insights_patched");
+        if tag_file.exists() {
+            continue;
+        }
+
+        // Check if already patched: read FileDescription silently with CREATE_NO_WINDOW
+        let already_patched = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command",
+                &format!("[System.Diagnostics.FileVersionInfo]::GetVersionInfo('{}').FileDescription",
+                    chrome.display())
+            ])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .filter(|s| s.contains("Opinion Insights"))
+            .is_some();
+
+        if already_patched {
+            let _ = std::fs::write(&tag_file, "patched");
+            eprintln!("[runtime] chrome.exe identity already correct in {dir_name}");
+            continue;
+        }
+
+        let Some(rcedit) = find_rcedit() else {
+            eprintln!("[runtime] rcedit not found; ShardX branding will persist in {dir_name}");
+            continue;
+        };
+
+        let mut args: Vec<String> = vec![
+            chrome.display().to_string(),
+            "--set-version-string".into(), "FileDescription".into(), "Opinion Insights Browser Engine".into(),
+            "--set-version-string".into(), "ProductName".into(), "Opinion Insights Browser".into(),
+            "--set-version-string".into(), "CompanyName".into(), "Opinion Insights".into(),
+            "--set-version-string".into(), "LegalCopyright".into(),
+                "Copyright 2026 Opinion Insights. All rights reserved.".into(),
+            "--set-version-string".into(), "InternalName".into(), "opinion-insights-browser-engine".into(),
+            "--set-version-string".into(), "OriginalFilename".into(), "chrome.exe".into(),
+        ];
+        // Set icon if we can find the .ico.
+        if let Some(ref ico) = icon_path {
+            args.push("--set-icon".into());
+            args.push(ico.display().to_string());
+        }
+
+        match std::process::Command::new(&rcedit)
+            .args(&args)
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+        {
+            Ok(out) if out.status.success() => {
+                let _ = std::fs::write(&tag_file, "patched");
+                eprintln!("[runtime] ✅ Patched chrome.exe identity in {dir_name}");
+            }
+            Ok(out) => {
+                let err = String::from_utf8_lossy(&out.stderr);
+                eprintln!("[runtime] rcedit failed on {dir_name}: {err}");
+            }
+            Err(e) => {
+                eprintln!("[runtime] rcedit spawn error on {dir_name}: {e}");
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn patch_chrome_identity() {}
+
+/// Find rcedit-x64.exe from known locations.
+#[cfg(target_os = "windows")]
+fn find_rcedit() -> Option<PathBuf> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+    // 1. Next to launcher executable or in its resources/ dir (Tauri bundle).
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            for name in &["rcedit-x64.exe", "rcedit.exe"] {
+                let p = dir.join(name);
+                if p.exists() { return Some(p); }
+                // Tauri bundles resources in a subdirectory.
+                let p2 = dir.join("resources").join(name);
+                if p2.exists() { return Some(p2); }
+            }
+        }
+    }
+    // 2. Known npm/tool locations relative to %LOCALAPPDATA% and %APPDATA%.
+    let local = std::env::var("LOCALAPPDATA").unwrap_or_default();
+    let appdata = std::env::var("APPDATA").unwrap_or_default();
+    let candidates: &[&str] = &[
+        // Antigravity IDE / hermes ship rcedit.
+        "hermes\\hermes-agent\\node_modules\\rcedit\\bin\\rcedit-x64.exe",
+        "Programs\\Antigravity IDE\\resources\\app\\node_modules\\rcedit\\bin\\rcedit-x64.exe",
+    ];
+    for rel in candidates {
+        let p = PathBuf::from(&local).join(rel);
+        if p.exists() { return Some(p); }
+    }
+    // npm global rcedit
+    let npm_global = PathBuf::from(&appdata).join("npm").join("node_modules").join("rcedit").join("bin").join("rcedit-x64.exe");
+    if npm_global.exists() { return Some(npm_global); }
+    // 3. PATH.
+    if let Ok(out) = std::process::Command::new("where")
+        .arg("rcedit-x64")
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+    {
+        let s = String::from_utf8_lossy(&out.stdout);
+        let first = s.lines().next().unwrap_or("").trim();
+        if !first.is_empty() {
+            return Some(PathBuf::from(first));
+        }
+    }
+    None
+}
+
+/// Find the application icon .ico to embed in chrome.exe.
+#[cfg(target_os = "windows")]
+fn find_launcher_icon() -> Option<PathBuf> {
+    // Next to current exe (installed bundle).
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            // Tauri 2 bundles icons in resources/ subdir of the exe dir.
+            for rel in &["icons/icon.ico", "resources/icons/icon.ico", "icon.ico"] {
+                let p = dir.join(rel);
+                if p.exists() { return Some(p); }
+            }
+        }
+    }
+    // Dev tree.
+    let dev = PathBuf::from("src-tauri/icons/icon.ico");
+    if dev.exists() { return Some(dev); }
+    None
+}
+
+/// Handle the CDN archive rename between versions:
+///   old archive: `ShardX-Windows.zip`  → extracts to `ShardX-Windows/`
+///   new archive: still `ShardX-Windows.zip` but binary_path looks there first
+///
+/// If chrome.exe is in one dir but not the other, we mirror files so both
+/// the installed (old) binary and the dev/new binary can find chrome.exe.
+/// This is idempotent and cheap (skips files that already exist).
+#[cfg(target_os = "windows")]
+fn migrate_engine_dir() {
+    let Ok(base) = runtime_dir() else { return };
+    let shardx = base.join("ShardX-Windows");
+    let engine = base.join("Opinion-Insights-Engine");
+
+    let shardx_ok = shardx.join("chrome.exe").exists();
+    let engine_ok = engine.join("chrome.exe").exists();
+
+    if shardx_ok && !engine_ok {
+        // New download (ShardX-Windows) but old binary expects Opinion-Insights-Engine.
+        // Mirror into Opinion-Insights-Engine so the installed binary works too.
+        eprintln!("[runtime] Mirroring ShardX-Windows → Opinion-Insights-Engine for backward compat");
+        mirror_dir(&shardx, &engine);
+    } else if engine_ok && !shardx_ok {
+        // Old layout: Opinion-Insights-Engine exists but new binary_path checks ShardX-Windows first.
+        // Mirror so our new binary also works without a fresh download.
+        eprintln!("[runtime] Mirroring Opinion-Insights-Engine → ShardX-Windows for forward compat");
+        mirror_dir(&engine, &shardx);
+    }
+    // Both exist or neither: nothing to do.
+}
+
+#[cfg(not(target_os = "windows"))]
+fn migrate_engine_dir() {}
+
+/// Copy files from `src` into `dst`, skipping files that already exist in `dst`.
+/// Recurses into sub-directories.
+fn mirror_dir(src: &std::path::Path, dst: &std::path::Path) {
+    let _ = fs::create_dir_all(dst);
+    let Ok(entries) = fs::read_dir(src) else { return };
+    for ent in entries.flatten() {
+        let src_path = ent.path();
+        let dst_path = dst.join(ent.file_name());
+        let Ok(ft) = ent.file_type() else { continue };
+        if ft.is_dir() {
+            mirror_dir(&src_path, &dst_path);
+        } else if ft.is_file() && !dst_path.exists() {
+            let _ = fs::copy(&src_path, &dst_path);
+        }
+    }
+}
+
 
 fn engine_outdated(local: &Manifest, remote: &RemoteManifest, browser_key: &str) -> bool {
     let version_moved = remote
@@ -649,25 +922,28 @@ fn copy_bundled_dir_if_present(engine_dir_name: &str) -> bool {
         return true;
     }
 
-    let mut cand_paths = Vec::new();
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            cand_paths.push(dir.join("resources").join(engine_dir_name));
-            cand_paths.push(dir.join("_up_").join("resources").join(engine_dir_name));
-            cand_paths.push(dir.join(engine_dir_name));
+    let search_names = [engine_dir_name, "Opinion-Insights-Engine", "ShardX-Windows"];
+    for name in search_names {
+        let mut cand_paths = Vec::new();
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                cand_paths.push(dir.join("resources").join(name));
+                cand_paths.push(dir.join("_up_").join("resources").join(name));
+                cand_paths.push(dir.join(name));
+            }
         }
-    }
-    cand_paths.push(PathBuf::from("src-tauri").join("resources").join(engine_dir_name));
-    cand_paths.push(PathBuf::from("resources").join(engine_dir_name));
-    cand_paths.push(PathBuf::from(engine_dir_name));
+        cand_paths.push(PathBuf::from("src-tauri").join("resources").join(name));
+        cand_paths.push(PathBuf::from("resources").join(name));
+        cand_paths.push(PathBuf::from(name));
 
-    for src in cand_paths {
-        if src.exists() {
-            eprintln!("[runtime] Copying bundled runtime directory from {} to {}", src.display(), dest_dir.display());
-            let _ = std::fs::create_dir_all(&dest_dir);
-            let _ = copy_dir_all(&src, &dest_dir);
-            if dest_dir.join("chrome.exe").exists() || dest_dir.join("chrome").exists() {
-                return true;
+        for src in cand_paths {
+            if src.exists() && (src.join("chrome.exe").exists() || src.join("chrome").exists()) {
+                eprintln!("[runtime] Copying bundled runtime directory from {} to {}", src.display(), dest_dir.display());
+                let _ = std::fs::create_dir_all(&dest_dir);
+                let _ = copy_dir_all(&src, &dest_dir);
+                if dest_dir.join("chrome.exe").exists() || dest_dir.join("chrome").exists() {
+                    return true;
+                }
             }
         }
     }
@@ -711,9 +987,9 @@ pub async fn runtime_install(window: Window, force: bool) -> Result<RuntimeStatu
         ));
     }
 
-    // Manifest unreachable → don't force a re-download.
-    let need_browser =
-        force || !installed_now || engine_outdated(&local, &manifest, &spec.browser.key);
+    // When runtime is already installed, skip re-download unless remote manifest exists and forces update.
+    let need_browser = !installed_now
+        && (force || manifest.archives.contains_key(&spec.browser.key));
     let browser_etag = if need_browser {
         // Wipe the old engine tree first. The archive extracts *over* the
         // existing dir but never deletes files the new version dropped — most
@@ -721,9 +997,15 @@ pub async fn runtime_install(window: Window, force: bool) -> Result<RuntimeStatu
         // new one and poisons version detection into an endless re-download (and
         // stale DLLs/.so could be loaded). Applies to win + linux + mac alike.
         let _ = fs::remove_dir_all(base.join(engine_root_dir()));
-        download_and_extract(&window, &spec.browser, &base)
+        let _ = fs::remove_dir_all(base.join("Opinion-Insights-Engine"));
+        let _ = fs::remove_dir_all(base.join("ShardX-Windows"));
+        let etag = download_and_extract(&window, &spec.browser, &base)
             .await
-            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
+        // Patch PE version-info so Windows shell shows "Opinion Insights Browser"
+        // instead of the upstream "ShardX" branding in the archive.
+        patch_chrome_identity();
+        etag
     } else {
         local.browser_etag.clone().unwrap_or_default()
     };
@@ -1100,10 +1382,14 @@ fn place_widevine(base: &Path) -> Result<()> {
     if !src.exists() {
         return Ok(());
     }
-    let engine_dir = if base.join("Opinion-Insights-Engine").exists() {
-        base.join("Opinion-Insights-Engine")
-    } else {
+    let engine_dir = if base.join("ShardX-Windows").join("chrome.exe").exists() {
         base.join("ShardX-Windows")
+    } else if base.join("Opinion-Insights-Engine").join("chrome.exe").exists() {
+        base.join("Opinion-Insights-Engine")
+    } else if base.join("ShardX-Windows").exists() {
+        base.join("ShardX-Windows")
+    } else {
+        base.join("Opinion-Insights-Engine")
     };
     let dst = engine_dir.join("WidevineCdm");
     if dst.exists() {

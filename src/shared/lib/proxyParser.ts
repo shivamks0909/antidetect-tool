@@ -9,6 +9,7 @@ export interface ParsedProxyResult {
   raw_input: string;
   scheme: string;
   protocol: string;
+  source_format?: string;
   host: string;
   port: number;
   username: string | null;
@@ -142,6 +143,7 @@ export class GeolocationFormatHandler implements ProxyFormatHandler {
       raw_input: rawString,
       scheme: "geolocation",
       protocol: "geolocation",
+      source_format: "geolocation",
       host,
       port: portNum,
       username,

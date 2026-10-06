@@ -16,21 +16,8 @@ import {
   folderDelete, cookiesExportToFile, cookiesImport,
 } from "../model/api";
 import { defaultForm, fromStored, toStored } from "../model/form";
-import { API_BASE, apiFetch } from "../../../config/api";
 
-const getFolderStorageKey = (): string => {
-  try {
-    const rawToken = localStorage.getItem("opinion_jwt_token");
-    if (rawToken) {
-      const parts = rawToken.split(".");
-      if (parts.length === 3) {
-        const payload = JSON.parse(atob(parts[1]));
-        if (payload?.id) return `oi_folders_${payload.id}`;
-      }
-    }
-  } catch {}
-  return "oi_folders_anonymous";
-};
+const getFolderStorageKey = (): string => "oi_folders_default";
 
 const loadFolderRegistry = (): string[] => {
   try {
@@ -189,8 +176,6 @@ export const useProfile = create<ProfileStore>((set, get) => ({
 
   init: async () => {
     if (get().status === "loading" || get().status === "ready") return;
-    const token = localStorage.getItem("opinion_jwt_token");
-    if (!token) return;
     set({ status: "loading", folderRegistry: loadFolderRegistry() });
     try {
       const [profiles, proxies, fingerprints] = await Promise.all([
@@ -232,7 +217,13 @@ export const useProfile = create<ProfileStore>((set, get) => ({
           next[r.profile_id] = prev[r.profile_id] ?? (now - r.uptime_ms);
         }
         const justExited = Object.keys(prev).some((id) => !(id in next));
-        set({ running: next });
+        const prevKeys = Object.keys(prev);
+        const nextKeys = Object.keys(next);
+        const changed = prevKeys.length !== nextKeys.length ||
+          prevKeys.some((k) => prev[k] !== next[k]);
+        if (changed) {
+          set({ running: next });
+        }
         if (justExited) get().reload();
       } catch {}
     };
@@ -320,26 +311,6 @@ export const useProfile = create<ProfileStore>((set, get) => ({
       const saved = await profileSave(storedPayload);
       await profileBindProxy(saved.id, draft.proxy_id);
 
-      // Server-side sync to MongoDB Atlas (full antidetect configuration payload)
-      const token = localStorage.getItem("opinion_jwt_token");
-      if (token) {
-        apiFetch(`${API_BASE}/data/profiles`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${token}`,
-          },
-          body: JSON.stringify({
-            ...storedPayload,
-            ...saved,
-            _meta: {
-              ...(storedPayload._meta || {}),
-              id: saved.id,
-              proxy_id: draft.proxy_id,
-            },
-          }),
-        }).catch((err) => console.warn("[DataSync] Profile server sync notice:", err));
-      }
       // A profile created while a folder tab is active should land in that
       // folder (otherwise it pops into "All" and the user has to drag it back).
       // `!draft.id` scopes this to creations only — edits keep their folder.
@@ -392,17 +363,6 @@ export const useProfile = create<ProfileStore>((set, get) => ({
         try { await processKill(id); } catch {}
       }
       await profileDelete(id);
-      const token = localStorage.getItem("opinion_jwt_token");
-      if (token) {
-        try {
-          await apiFetch(`${API_BASE}/data/profiles/${id}`, {
-            method: "DELETE",
-            headers: { Authorization: `Bearer ${token}` },
-          });
-        } catch (err) {
-          console.warn("[DataSync] Profile delete sync notice:", err);
-        }
-      }
       await get().reload();
       storeBus.emit("profiles");
     } catch (e) { toast.err(String(e)); }
@@ -559,21 +519,12 @@ export const useProfile = create<ProfileStore>((set, get) => ({
       message: `Move ${ids.length} profile${ids.length === 1 ? "" : "s"} to the trash? They can be restored there for 7 days.`,
       danger: true,
     })) !== true) return;
-    const token = localStorage.getItem("opinion_jwt_token");
     for (const id of ids) {
       try {
         if (get().running[id]) {
           try { await processKill(id); } catch {}
         }
         await profileDelete(id);
-        if (token) {
-          try {
-            await apiFetch(`${API_BASE}/data/profiles/${id}`, {
-              method: "DELETE",
-              headers: { Authorization: `Bearer ${token}` },
-            });
-          } catch {}
-        }
       } catch (e) { toast.err(String(e)); }
     }
     get().clearSelected();

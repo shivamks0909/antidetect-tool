@@ -42,5 +42,12 @@ shardx-launcher/runtime/
 # Update server - ignore uploaded binaries but track metadata
 server/update/files/
 
-# Update server - ignore uploaded binaries but track metadata
-server/update/files/
+# Large archives and caches
+*.zip
+.wrangler/
+shardx-launcher/
+src-tauri/resources/Opinion-Insights-Engine/
+*.log
+*.txt
+backup-extracted/
+

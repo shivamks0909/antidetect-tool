@@ -14,7 +14,6 @@ import { BookmarksPage } from "../pages/bookmarks";
 import { TrashPage } from "../pages/trash";
 import { SettingsPage } from "../pages/settings";
 import { PatchLogPage } from "../pages/patchlog";
-import { AdminPage } from "../pages/admin/AdminPage";
 import { useNav } from "../shared/model/navigation";
 import { trackSection } from "../shared/lib/analytics";
 import { UpdateModal, UpdateBanner, usePeriodicUpdateCheck } from "../features/updater";
@@ -47,7 +46,6 @@ export function App() {
             {section === "trash" && <TrashPage />}
             {section === "patchlog" && <PatchLogPage />}
             {section === "settings" && <SettingsPage />}
-            {section === "admin" && <AdminPage />}
           </main>
           <ToastHost />
           <ConfirmHost />

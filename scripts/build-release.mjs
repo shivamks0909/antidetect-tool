@@ -12,11 +12,10 @@ const env = {
   TAURI_SIGNING_PRIVATE_KEY_PASSWORD: 'OpinionInsightsSecureUpdateKey2026',
 };
 
-console.log('[BUILD] Signing private key loaded successfully (' + keyContent.length + ' chars).');
 console.log('[BUILD] Executing npx tauri build...');
 
 try {
-  execSync('npx tauri build', { stdio: 'inherit', env });
+  execSync('npx tauri build', { stdio: 'inherit' });
   console.log('[BUILD] Release build completed successfully!');
 } catch (err) {
   console.error('[BUILD] Build failed:', err.message);
